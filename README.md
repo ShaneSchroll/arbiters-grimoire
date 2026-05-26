@@ -14,6 +14,9 @@ card text from Scryfall when a question names a specific card.
 | `mtg_api.py`        | Scryfall card-lookup tool exposed to Claude.                |
 | `server.py`         | FastAPI backend: retrieval + Claude tool loop.              |
 | `static/index.html` | The chat UI (vanilla HTML/JS, no build step).               |
+| `auth.py`           | SQLite-backed login, sessions, and approval gate.           |
+| `admin.py`          | CLI for approving users and minting password-reset links.   |
+| `auth_pages/`       | Login, register, and reset pages.                           |
 
 ## Setup
 

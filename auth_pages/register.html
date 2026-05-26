@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Create account &middot; The Oracle</title>
+        <link rel="stylesheet" href="/static/styles.css" />
+    </head>
+
+    <body class="auth-page">
+        <div class="card">
+            <h1>The <span>Oracle</span></h1>
+            <p class="sub">Request access. An administrator must approve your account before you can sign in.</p>
+
+            <form id="form">
+                <label for="email">Email</label>
+                <input id="email" type="email" autocomplete="email" required />
+
+                <label for="password">Password</label>
+                <input id="password" type="password" autocomplete="new-password" minlength="12" required />
+                <div class="hint">Minimum 12 characters.</div>
+
+                <label for="confirm">Confirm password</label>
+                <input id="confirm" type="password" autocomplete="new-password" minlength="12" required />
+
+                <button id="submit" type="submit">Create account</button>
+                <div class="msg" id="msg"></div>
+            </form>
+
+            <div class="links">
+                <a href="/login">Already have an account? Sign in</a>
+            </div>
+        </div>
+
+        <script>
+            const form = document.getElementById("form");
+            const msg = document.getElementById("msg");
+            const submit = document.getElementById("submit");
+
+            form.addEventListener("submit", async (e) => {
+                e.preventDefault();
+                msg.className = "msg";
+                msg.textContent = "";
+
+                const password = document.getElementById("password").value;
+                const confirm = document.getElementById("confirm").value;
+
+                if (password !== confirm) {
+                    msg.className = "msg error";
+                    msg.textContent = "Passwords do not match.";
+                    return;
+                }
+
+                submit.disabled = true;
+
+                try {
+                    const res = await fetch("/api/auth/register", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            email: document.getElementById("email").value,
+                            password,
+                        }),
+                    });
+
+                    const data = await res.json().catch(() => ({}));
+
+                    if (res.ok) {
+                        msg.className = "msg ok";
+                        msg.textContent = data.message || "Account submitted for approval.";
+                        form.reset();
+                    } else {
+                        msg.className = "msg error";
+                        msg.textContent = data.detail || "Registration failed.";
+                    }
+                } catch {
+                    msg.className = "msg error";
+                    msg.textContent = "Could not reach the server.";
+                } finally {
+                    submit.disabled = false;
+                }
+            });
+        </script>
+    </body>
+</html>

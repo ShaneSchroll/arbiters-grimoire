@@ -5,3 +5,8 @@ errors.txt
 *.map
 
 /__pycache__
+
+users.db
+users.db-journal
+users.db-wal
+users.db-shm
