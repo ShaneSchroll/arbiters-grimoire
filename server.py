@@ -28,15 +28,15 @@ from retriever import Retriever
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load the API key from a .env sitting next to this file (if present).
+# Load the API key from environment
 load_dotenv(BASE_DIR / ".env")
 
-client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+client = Anthropic()  # reads ANTHROPIC_API_KEY
 retriever = Retriever()
 
 
 def find_index_html() -> Path:
-    """Locate index.html whether or not the 'static' subfolder survived."""
+    """Locate index.html"""
     for candidate in (
         BASE_DIR / "static" / "index.html",
         BASE_DIR / "index.html",
@@ -52,10 +52,10 @@ def find_index_html() -> Path:
 
 INDEX_HTML = find_index_html()  # fail fast at startup with a clear message
 
-# Models the UI dropdown can pick. Opus is the default for the hardest rules
+# Models available in the dropdown. Opus is the default for the hardest rules
 # interactions; Sonnet is faster and cheaper for everyday questions.
-ALLOWED_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6"}
-DEFAULT_MODEL = "claude-opus-4-7"
+ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-7"}
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 # Static, cacheable persona. Kept separate from the per-question rules text so
 # it can be marked with cache_control and reused cheaply across requests.

@@ -4,8 +4,7 @@ retriever.py — Keyword (BM25) search over the chunks produced by ingest.py.
 BM25 is a strong fit for a rules document: Magic terminology is precise
 ("first strike", "state-based actions", "the stack"), so exact-term matching
 retrieves the right rules reliably without needing an embedding model or any
-extra API calls. To upgrade to semantic search later, swap `Retriever.search`
-for an embedding-based lookup — the interface can stay the same.
+extra API calls.
 """
 
 import json
@@ -29,8 +28,7 @@ class Retriever:
             raise FileNotFoundError(
                 "index.json not found. Run `python ingest.py <your.pdf>` first."
             )
-        # encoding="utf-8" matches how ingest.py writes the file; without it
-        # Windows would fail to read characters like the minus sign (U+2212).
+        # encoding="utf-8" matches how ingest.py writes the file
         self.chunks = json.loads(path.read_text(encoding="utf-8"))
         self._bm25 = BM25Okapi([tokenize(c["text"]) for c in self.chunks])
 

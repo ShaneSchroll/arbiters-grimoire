@@ -1,7 +1,7 @@
 """
-ingest.py — One-time preprocessing of your MTG rulebook PDF.
+ingest.py - One-time preprocessing of your MTG rulebook PDF.
 
-Run this once (or whenever your PDF changes):
+Run this once (or when the rules change - official magic rules pdf used):
 
     python ingest.py path/to/MagicCompRules.pdf
 
@@ -22,7 +22,8 @@ from pathlib import Path
 import pdfplumber
 
 RULE_START = re.compile(r"^(\d{3}\.\d+)\.?\s")          # base rule, e.g. "509.2."
-# A line that is *only* the word Glossary or Credits — the real section headings.
+
+# A line that is *only* the word Glossary or Credits - the real section headings.
 STOP_SECTION = re.compile(r"^(glossary|credits)\s*$", re.IGNORECASE)
 
 
@@ -48,7 +49,7 @@ def chunk_rules(text: str):
     lines = text.splitlines()
     chunks = []
     current = None  # {"rule": str, "lines": [str]}
-    seen = 0        # how many rules we've started — guards against TOC noise
+    seen = 0        # how many rules we've started - guards against TOC noise
 
     for line in lines:
         stripped = line.strip()
@@ -71,7 +72,7 @@ def chunk_rules(text: str):
         chunks.append(current)
 
     if len(chunks) < 20:
-        return []  # not the Comprehensive Rules — caller should fall back
+        return []  # not the Comprehensive Rules - caller should fall back
 
     return [
         {
