@@ -1,0 +1,7 @@
+.env
+errors.txt
+*.pdf
+*.log
+*.map
+
+/__pycache__
