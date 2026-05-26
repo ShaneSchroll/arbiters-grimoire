@@ -28,6 +28,35 @@ logoutEl.addEventListener("click", async () => {
     finally { window.location.href = "/login"; }
 });
 
+// Mobile-only account menu (display:contents on desktop, popup on mobile).
+const accountToggle = document.getElementById("account-toggle");
+const accountMenu = document.getElementById("account-menu");
+
+function closeAccountMenu() {
+    accountMenu.classList.remove("open");
+    accountToggle.setAttribute("aria-expanded", "false");
+}
+
+accountToggle.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = accountMenu.classList.toggle("open");
+    accountToggle.setAttribute("aria-expanded", String(open));
+});
+
+// Click anywhere outside the menu (or its toggle) closes it.
+document.addEventListener("click", (e) => {
+    if (!accountMenu.contains(e.target) && e.target !== accountToggle) {
+        closeAccountMenu();
+    }
+});
+
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && accountMenu.classList.contains("open")) {
+        closeAccountMenu();
+        accountToggle.focus();
+    }
+});
+
 function escapeHtml(s) {
     return s.replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
 }

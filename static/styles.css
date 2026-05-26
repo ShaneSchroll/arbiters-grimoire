@@ -292,6 +292,22 @@ button.logout:hover {
 }
 
 /**
+  * Account menu
+  * Desktop: the toggle button is hidden and the menu uses display:contents
+  * so its children (Rulebook, model select, #who, Logout) flow directly into
+  * the header's flex layout exactly as if they were unwrapped.
+  * Mobile rules below collapse them into a popup.
+*/
+
+.account-toggle {
+    display: none;
+}
+
+.account-menu {
+    display: contents;
+}
+
+/**
   * Footer disclosure
 */
 
@@ -421,4 +437,141 @@ body.auth-page {
 
 .card .links a:hover {
     text-decoration: underline;
+}
+
+/**
+  * Mobile (phones in portrait and small landscape)
+  * Affects the chat page only; auth pages are already centered+capped
+  * at 380px so they look correct on phones without changes.
+*/
+
+@media (max-width: 640px) {
+    header {
+        padding: 10px 14px;
+        gap: 10px;
+        position: relative;  /* anchor for the absolute-positioned popup */
+    }
+
+    h1 {
+        font-size: 15px;
+        min-width: 0;        /* allow shrink without overflowing the row */
+    }
+
+    /* Show the toggle and replace display:contents with display:none on
+       the menu, so the children disappear from the header until opened. */
+    .account-toggle {
+        display: inline-flex;
+        align-items: center;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 6px 10px;
+        font-size: 13px;
+        cursor: pointer;
+    }
+
+    .account-toggle:hover {
+        border-color: var(--accent);
+    }
+
+    .account-toggle::after {
+        content: "\25BE";    /* small down-pointing triangle */
+        margin-left: 6px;
+        font-size: 10px;
+        display: inline-block;
+        transition: transform .15s ease;
+    }
+
+    .account-toggle[aria-expanded="true"]::after {
+        transform: rotate(180deg);
+    }
+
+    .account-menu {
+        display: none;
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 14px;
+        min-width: 220px;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, .45);
+        z-index: 100;
+    }
+
+    .account-menu.open {
+        display: flex;
+    }
+
+    /* Normalize Rulebook and Logout to the same look inside the popup. */
+    .account-menu .rulebook-link,
+    .account-menu button.logout {
+        display: block;
+        width: 100%;
+        text-align: center;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 9px 12px;
+        font-size: 13px;
+        text-decoration: none;
+        cursor: pointer;
+    }
+
+    .account-menu .rulebook-link:hover,
+    .account-menu button.logout:hover {
+        border-color: var(--accent);
+    }
+
+    /* Model select keeps its own form-control look but stretches to row. */
+    .account-menu select {
+        width: 100%;
+        padding: 9px 12px;
+        font-size: 13px;
+    }
+
+    /* Signed-in email becomes a small label at the top of the popup. */
+    .account-menu #who {
+        order: -1;
+        max-width: 100%;
+        font-size: 12px;
+        color: var(--muted);
+        text-align: left;
+        padding-bottom: 8px;
+        margin-bottom: 2px;
+        border-bottom: 1px solid var(--line);
+    }
+
+    .wrap {
+        padding: 0 14px;
+    }
+
+    #chat {
+        padding: 18px 0;
+    }
+
+    .bubble {
+        max-width: 92%;
+        padding: 11px 14px;
+    }
+
+    .empty {
+        margin-top: 8vh;
+    }
+
+    /* Stack textarea above a full-width send button. */
+    .inputrow {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    button.send {
+        width: 100%;
+        padding: 11px 16px;
+    }
 }

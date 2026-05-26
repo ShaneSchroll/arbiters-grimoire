@@ -1,5 +1,4 @@
 .env
-errors.txt
 *.pdf
 *.log
 *.map

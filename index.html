@@ -21,21 +21,32 @@
 
             <h1>The <span>Oracle</span></h1>
 
-            <a
-                class="rulebook-link"
-                href="https://magic.wizards.com/en/rules"
-                target="_blank"
-                rel="noopener noreferrer">
-                Rulebook
-            </a>
+            <button
+                id="account-toggle"
+                class="account-toggle"
+                type="button"
+                aria-expanded="false"
+                aria-controls="account-menu">
+                Account
+            </button>
 
-            <select id="model" title="Choose the underlying model">
-                <option value="claude-sonnet-4-6">Sonnet 4.6 &middot; Fast</option>
-                <option value="claude-opus-4-7">Opus 4.7 &middot; Max</option>
-            </select>
+            <div id="account-menu" class="account-menu">
+                <a
+                    class="rulebook-link"
+                    href="https://magic.wizards.com/en/rules"
+                    target="_blank"
+                    rel="noopener noreferrer">
+                    Rulebook
+                </a>
 
-            <span id="who" title="Signed in as"></span>
-            <button id="logout" class="logout" type="button">Log out</button>
+                <select id="model" title="Choose the underlying model">
+                    <option value="claude-sonnet-4-6">Sonnet 4.6 &middot; Fast</option>
+                    <option value="claude-opus-4-7">Opus 4.7 &middot; Max</option>
+                </select>
+
+                <span id="who" title="Signed in as"></span>
+                <button id="logout" class="logout" type="button">Log out</button>
+            </div>
         </header>
 
         <div id="chat">
@@ -64,7 +75,7 @@
         </footer>
 
         <div class="disclosure">
-            <p>This site is not affiliated with Wizards of the Coast &trade; </p>
+            <p>This site is not affiliated with, endorsed by, or sponsored by Wizards of the Coast &trade;.</p>
         </div>
     </body>
 </html>
