@@ -315,7 +315,7 @@ button.logout:hover {
     text-align: center;
     color: var(--muted);
     font-size: 11px;
-    padding: 8px 0;
+    padding: 8px;
     background: var(--panel);
     border-top: 1px solid var(--line);
 }
@@ -440,25 +440,21 @@ body.auth-page {
 }
 
 /**
-  * Mobile (phones in portrait and small landscape)
-  * Affects the chat page only; auth pages are already centered+capped
-  * at 380px so they look correct on phones without changes.
+  * Mobile tweaks (phones in portrait and small landscape)
 */
 
 @media (max-width: 640px) {
     header {
         padding: 10px 14px;
         gap: 10px;
-        position: relative;  /* anchor for the absolute-positioned popup */
+        position: relative; /* anchor for the absolute-positioned popup */
     }
 
     h1 {
         font-size: 15px;
-        min-width: 0;        /* allow shrink without overflowing the row */
+        min-width: 0; /* allow shrink without overflowing the row */
     }
 
-    /* Show the toggle and replace display:contents with display:none on
-       the menu, so the children disappear from the header until opened. */
     .account-toggle {
         display: inline-flex;
         align-items: center;
@@ -476,7 +472,7 @@ body.auth-page {
     }
 
     .account-toggle::after {
-        content: "\25BE";    /* small down-pointing triangle */
+        content: "\25BE";
         margin-left: 6px;
         font-size: 10px;
         display: inline-block;
@@ -507,32 +503,43 @@ body.auth-page {
         display: flex;
     }
 
-    /* Normalize Rulebook and Logout to the same look inside the popup. */
+    /* Identical sizing/style for popup items */
     .account-menu .rulebook-link,
-    .account-menu button.logout {
+    .account-menu button.logout,
+    .account-menu select {
         display: block;
         width: 100%;
-        text-align: center;
+        box-sizing: border-box;
+        height: 40px;
+        line-height: 38px; /* height minus 2 x border */
+        padding: 0 14px;
         background: var(--panel-2);
         color: var(--text);
         border: 1px solid var(--line);
-        border-radius: 7px;
-        padding: 9px 12px;
-        font-size: 13px;
+        border-radius: 8px;
+        font-family: inherit;
+        font-size: 15px;
+        text-align: center;
         text-decoration: none;
         cursor: pointer;
     }
 
     .account-menu .rulebook-link:hover,
-    .account-menu button.logout:hover {
+    .account-menu button.logout:hover,
+    .account-menu select:hover {
         border-color: var(--accent);
     }
 
-    /* Model select keeps its own form-control look but stretches to row. */
     .account-menu select {
-        width: 100%;
-        padding: 9px 12px;
-        font-size: 13px;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
+        padding: 0 32px;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='%239a9db0'><path d='M6 8 0 0h12z'/></svg>");
+        background-repeat: no-repeat;
+        background-position: right 12px center;
+        background-size: 10px;
+        text-align-last: center;
     }
 
     /* Signed-in email becomes a small label at the top of the popup. */
