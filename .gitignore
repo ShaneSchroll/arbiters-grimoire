@@ -4,7 +4,8 @@ errors.txt
 *.log
 *.map
 
-/__pycache__
+__pycache__/
+*.pyc
 
 users.db
 users.db-journal

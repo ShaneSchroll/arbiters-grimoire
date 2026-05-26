@@ -32,6 +32,17 @@ python ingest.py path/to/MagicCompRules.pdf
 # 4. Start the app
 uvicorn server:app --port 8000
 ```
+## Commands to work with users (for now)
+
+```bash
+python admin.py list
+python admin.py create  alice@example.com [--admin] [--approved]
+python admin.py approve alice@example.com
+python admin.py revoke  alice@example.com
+python admin.py make-admin alice@example.com
+python admin.py reset   alice@example.com [--base-url https://oracle.example.com]
+python admin.py delete  alice@example.com [--yes]
+```
 
 Then open **http://localhost:8000**.
 
