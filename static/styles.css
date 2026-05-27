@@ -48,29 +48,23 @@ header {
     gap: 16px;
 }
 
-header .mana {
+.logo-link {
     display: flex;
-    gap: 4px;
+    flex: 1;
+    align-items: center;
+    text-decoration: none;
+    color: unset;
 }
 
-header .mana i {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    display: block;
+.logo-link img {
+    width: 32px;
+    margin-right: 12px;
 }
-
-.mw { background: var(--w); }
-.mu { background: var(--u); }
-.mb { background: var(--b); }
-.mr { background: var(--r); }
-.mg { background: var(--g); }
 
 h1 {
-    font-size: 17px;
+    font-size: 22px;
     font-weight: 600;
     letter-spacing: .3px;
-    flex: 1;
 }
 
 h1 span { color: var(--accent); }
@@ -685,6 +679,8 @@ header select {
 }
 
 .codex-tip-tag .pip {
+    position: relative;
+    top: -1px;
     width: 8px;
     height: 8px;
 }
