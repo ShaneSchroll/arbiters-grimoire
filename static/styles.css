@@ -61,7 +61,7 @@ header {
     margin-right: 12px;
 }
 
-h1 {
+.logo-link h1 {
     font-size: 22px;
     font-weight: 600;
     letter-spacing: .3px;
@@ -349,30 +349,35 @@ select {
 .empty {
     text-align: center;
     color: var(--muted);
-    margin-top: 14vh;
+    margin-top: 8vh;
 }
 
 .empty h2 {
-    font-weight: 500;
+    font-size: 48px;
+    font-weight: 700;
     color: var(--text);
     margin-bottom: 6px;
+}
+
+.empty h2 span {
+    color: var(--accent);
 }
 
 .examples {
     margin-top: 20px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 14px;
 }
 
 .examples button {
     background: var(--panel);
     border: 1px solid var(--line);
     color: var(--text);
-    padding: 10px 14px;
+    padding: 10px 12px;
     border-radius: 9px;
     cursor: pointer;
-    font-size: 14px;
+    font-size: 15px;
     text-align: left;
 }
 
@@ -1674,10 +1679,6 @@ body.auth-page {
         padding: 11px 14px;
     }
 
-    .empty {
-        margin-top: 8vh;
-    }
-
     /* Stack textarea above a full-width send button */
     .inputrow {
         flex-direction: column;
@@ -1687,5 +1688,11 @@ body.auth-page {
     button.send {
         width: 100%;
         padding: 11px 16px;
+    }
+}
+
+@media (max-width: 400px) {
+    .empty h2 {
+        font-size: 42px;
     }
 }
