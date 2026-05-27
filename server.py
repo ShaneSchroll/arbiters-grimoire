@@ -19,6 +19,7 @@ Behind a proxy (Render):
 """
 
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,6 +33,10 @@ from pydantic import BaseModel
 import auth
 from mtg_api import CARD_TOOL, lookup_card
 from retriever import Retriever
+
+# Matches rule citations Claude is asked to produce, e.g. "509.2" or "509.2a".
+RULE_CITE = re.compile(r"\b(\d{3}\.\d+[a-z]?)\b")
+MAX_SOURCES = 6
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -120,9 +125,24 @@ def build_system(question: str):
         },
     ]
     sources = [
-        {"rule": h["rule"] or h["id"], "preview": h["text"][:160]} for h in hits
+        {"rule": h["rule"] or h["id"], "text": h["text"]} for h in hits
     ]
     return system, sources
+
+
+def filter_sources(answer: str, sources: list) -> list:
+    """Keep only sources whose rule number was actually cited in the answer.
+
+    Glossary chunks (rule is None, id like "chunk-0001") never match a
+    citation directly, so they drop out — but Claude almost always cites the
+    numbered rule the glossary entry points to, which IS in the retrieved set.
+    Falls back to the top 2 by relevance if nothing was cited (rare).
+    """
+    cited = set(RULE_CITE.findall(answer))
+    used = [s for s in sources if s["rule"] in cited]
+    if not used:
+        used = sources[:2]
+    return used[:MAX_SOURCES]
 
 
 @app.post("/api/chat")
@@ -150,7 +170,11 @@ def chat(req: ChatRequest, _user=Depends(auth.require_user)):
             answer = "".join(
                 b.text for b in resp.content if b.type == "text"
             )
-            return {"answer": answer, "sources": sources, "model": model}
+            return {
+                "answer": answer,
+                "sources": filter_sources(answer, sources),
+                "model": model,
+            }
 
         # Run every card lookup Claude requested, then loop back.
         messages.append({"role": "assistant", "content": resp.content})

@@ -151,10 +151,97 @@ select {
     border: 1px solid var(--line);
     border-radius: 6px;
     color: var(--muted);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    max-width: 100%;
+    /* Bubble sets pre-wrap; reset so chip text wraps on whitespace, not literally. */
+    white-space: normal;
+    transition: border-color .15s ease, background .15s ease;
+}
+
+.chip:hover,
+.chip:focus-visible {
+    border-color: var(--accent);
+    background: var(--panel);
+    outline: none;
 }
 
 .chip b {
     color: var(--accent);
+}
+
+/**
+  * Rule popup
+*/
+
+.rule-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1000;
+    animation: fade-in .12s ease-out;
+}
+
+.rule-modal {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 22px 24px;
+    max-width: 640px;
+    width: 100%;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, .55);
+}
+
+.rule-modal-title {
+    color: var(--accent);
+    font-size: 16px;
+    margin-bottom: 12px;
+    padding-right: 32px;
+}
+
+.rule-modal-body {
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.6;
+    word-wrap: break-word;
+}
+
+.rule-modal-body p + p {
+    margin-top: 10px;
+}
+
+.rule-modal-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    font-size: 24px;
+    line-height: 1;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 6px;
+}
+
+.rule-modal-close:hover,
+.rule-modal-close:focus-visible {
+    color: var(--text);
+    background: var(--panel-2);
+    outline: none;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
 }
 
 .empty {

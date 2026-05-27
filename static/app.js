@@ -57,6 +57,9 @@ document.addEventListener("keydown", (e) => {
     }
 });
 
+// Chip preview length. Keeps chips skim-able; full text is in the modal.
+const CHIP_TEXT_MAX = 120;
+
 function escapeHtml(s) {
     return s.replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
 }
@@ -70,6 +73,86 @@ function render(text) {
     return h;
 }
 
+// Collapse whitespace and clip to max chars; appends an ellipsis if clipped.
+function chipPreview(text) {
+    const flat = text.trim().replace(/\s+/g, " ");
+    return flat.length > CHIP_TEXT_MAX
+        ? flat.slice(0, CHIP_TEXT_MAX).trimEnd() + "…"
+        : flat;
+}
+
+// PDF extraction leaves hard newlines mid-sentence. Re-flow into paragraphs:
+// a line only starts a new paragraph if it begins with a rule number
+// (e.g. "120.5", "120.5a") or a labeled callout ("Example:").
+const PARA_START = /^(?:\d{3}\.\d+[a-z]?\.?\s|Example[:\s])/;
+
+function ruleParagraphs(text) {
+    const out = [];
+    let buf = "";
+    for (const raw of text.split("\n")) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (buf && PARA_START.test(line)) {
+            out.push(buf);
+            buf = line;
+        } else {
+            buf = buf ? buf + " " + line : line;
+        }
+    }
+    if (buf) out.push(buf);
+    return out;
+}
+
+function renderRule(text) {
+    return ruleParagraphs(text)
+        .map(p => "<p>" + render(p) + "</p>")
+        .join("");
+}
+
+function openRuleModal(rule, text) {
+    const backdrop = document.createElement("div");
+    backdrop.className = "rule-modal-backdrop";
+    backdrop.innerHTML =
+        '<div class="rule-modal" role="dialog" aria-modal="true" aria-labelledby="rule-modal-title">' +
+            '<button class="rule-modal-close" type="button" aria-label="Close">&times;</button>' +
+            '<h3 class="rule-modal-title" id="rule-modal-title">' + escapeHtml(rule) + '</h3>' +
+            '<div class="rule-modal-body">' + renderRule(text) + '</div>' +
+        '</div>';
+
+    function close() {
+        backdrop.remove();
+        document.removeEventListener("keydown", onKey);
+    }
+    function onKey(e) { if (e.key === "Escape") close(); }
+
+    backdrop.addEventListener("click", e => {
+        if (e.target === backdrop) close();
+    });
+    backdrop.querySelector(".rule-modal-close").addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+
+    document.body.appendChild(backdrop);
+    backdrop.querySelector(".rule-modal-close").focus();
+}
+
+function appendSources(bubble, sources) {
+    if (!sources || !sources.length) return;
+    const det = document.createElement("details");
+    det.className = "sources";
+    det.innerHTML = "<summary>Rule sources (" + sources.length + ")</summary>";
+    sources.forEach(s => {
+        const chip = document.createElement("button");
+        chip.className = "chip";
+        chip.type = "button";
+        chip.title = "Click to view full rule text";
+        chip.innerHTML = "<b>" + escapeHtml(s.rule) + "</b> — " +
+                        escapeHtml(chipPreview(s.text || ""));
+        chip.addEventListener("click", () => openRuleModal(s.rule, s.text || ""));
+        det.appendChild(chip);
+    });
+    bubble.appendChild(det);
+}
+
 function addMessage(role, text, sources) {
     if (emptyEl) emptyEl.remove();
 
@@ -79,20 +162,7 @@ function addMessage(role, text, sources) {
     bubble.className = "bubble";
     bubble.innerHTML = role === "user" ? escapeHtml(text) : render(text);
 
-    if (sources && sources.length) {
-        const det = document.createElement("details");
-        det.className = "sources";
-        det.innerHTML = "<summary>Rule sources (" + sources.length + ")</summary>";
-        sources.forEach(s => {
-            const c = document.createElement("span");
-            c.className = "chip";
-            c.innerHTML = "<b>" + escapeHtml(s.rule) + "</b> — " +
-                            escapeHtml(s.preview) + "…";
-            det.appendChild(c);
-        });
-
-        bubble.appendChild(det);
-    }
+    appendSources(bubble, sources);
 
     msg.appendChild(bubble);
     messagesEl.appendChild(msg);
@@ -129,22 +199,7 @@ async function send() {
 
         const data = await res.json();
         thinking.innerHTML = render(data.answer || "(no answer)");
-
-        if (data.sources && data.sources.length) {
-            const det = document.createElement("details");
-            det.className = "sources";
-            det.innerHTML = "<summary>Rule sources (" + data.sources.length + ")</summary>";
-
-            data.sources.forEach(s => {
-                const c = document.createElement("span");
-                c.className = "chip";
-                c.innerHTML = "<b>" + escapeHtml(s.rule) + "</b> — " + escapeHtml(s.preview) + "…";
-                det.appendChild(c);
-            });
-
-            thinking.appendChild(det);
-        }
-
+        appendSources(thinking, data.sources);
         history.push({ role: "assistant", content: data.answer || "" });
     } catch (e) {
         thinking.innerHTML = "Error reaching the server. Is it running?";
