@@ -95,19 +95,31 @@ def extract_sections(text: str):
     """Walk the PDF text once, pulling out the section + subsection titles
     used as TOC labels on the docs page.
 
+    Stops at the real Glossary heading. The Glossary contains terms with
+    numbered definitions (e.g. "Vanguard\\n1. A casual variant..."). Without
+    the stop, those "1." / "2." / "3." lines match SECTION_START and
+    clobber the real "Game Concepts" / "Parts of a Card" / "Card Types"
+    titles. Sections 4-9 survive only because no glossary entry happens to
+    have that many numbered definitions. The `seen_rules > 50` guard
+    mirrors chunk_rules() and ignores the word "Glossary" that appears in
+    the table of contents before any rules have started.
+
     A line that matches both as a section *and* as a subsection (or appears
     twice - once in the table of contents and again at its actual location)
-    is fine: we just overwrite with the same value. The TOC pass before any
-    rules also gets superseded by the in-body pass with the same text.
+    is fine: we just overwrite with the same value.
 
     Returns two dicts:
         sections    -> {"5": "The Combat Phase", ...}
         subsections -> {"509": "Declare Attackers Step", ...}
     """
     sections, subsections = {}, {}
+    seen_rules = 0
     for line in text.splitlines():
         stripped = line.strip()
+        if STOP_SECTION.match(stripped) and seen_rules > 50:
+            break
         if RULE_START.match(stripped):
+            seen_rules += 1
             continue  # skip rules - they look like "509.2. ..." not titles
         m_sub = SUBSECTION_START.match(stripped)
         if m_sub:

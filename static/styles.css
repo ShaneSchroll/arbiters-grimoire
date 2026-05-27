@@ -494,10 +494,13 @@ header select {
     -moz-appearance: none;
     appearance: none;
     padding-right: 28px;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='%239a9db0'><path d='M6 8 0 0h12z'/></svg>");
+    /* Same path data as /static/icons/caret.svg. <select> can't honor
+       currentColor on a background-image, so muted color is baked in.
+       Keep this in sync if caret.svg ever changes. */
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 640' fill='%239a9db0'><path d='M160 352C147.1 352 135.4 359.8 130.4 371.8C125.4 383.8 128.2 397.5 137.4 406.6L297.4 566.6C309.9 579.1 330.2 579.1 342.7 566.6L502.7 406.6C511.9 397.4 514.6 383.7 509.6 371.7C504.6 359.7 492.9 352 480 352L160 352z'/></svg>");
     background-repeat: no-repeat;
     background-position: right 10px center;
-    background-size: 9px;
+    background-size: 10px;
 }
 
 .tips-main-content {
@@ -558,29 +561,6 @@ header select {
     color: var(--muted);
     margin: 0;
     text-wrap: pretty;
-}
-
-.codex-meta {
-    margin: 24px auto 0;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px 18px;
-    font-size: 12.5px;
-    color: var(--muted);
-    align-items: center;
-}
-
-.codex-meta .dot { color: var(--muted-2); }
-
-.codex-meta .kbd {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 5px;
-    padding: 2px 6px;
-    color: var(--text);
-    margin-right: 6px;
 }
 
 /* Toolbar (layout toggle) */
@@ -1112,25 +1092,33 @@ header select {
     outline: none;
 }
 
-/* Chevron rotates when the section is expanded. Default state (collapsed)
-   points right; expanded points down. Width keeps the heading text aligned. */
-.toc-chevron {
-    display: inline-block;
-    width: 14px;
-    margin-right: 4px;
-    color: var(--muted);
-    font-size: 10px;
-    line-height: 1;
-    transition: transform .15s ease;
+.toc-section-title:hover .toc-num,
+.toc-section:not(.collapsed) > .toc-section-title .toc-num,
+.toc-section:not(.collapsed) > .toc-section-title {
+    color: var(--accent);
 }
 
-.toc-section:not(.collapsed) > .toc-section-title .toc-chevron {
-    transform: rotate(90deg);
+/* Chevron is the shared icon file rendered as a CSS mask, so its color
+   is whatever `background-color` we set. SVG points DOWN natively
+   (expanded state); collapsed rotates -90deg to point right. */
+.toc-chevron {
+    display: inline-block;
+    width: 17px;
+    height: 17px;
+    margin-right: 4px;
+    background-color: var(--muted);
+    -webkit-mask: url("/static/icons/chevron.svg") no-repeat center / 60% 60%;
+            mask: url("/static/icons/chevron.svg") no-repeat center / 60% 60%;
+    transition: transform .15s ease, background-color .15s ease;
+}
+
+.toc-section.collapsed > .toc-section-title .toc-chevron {
+    transform: rotate(-90deg);
 }
 
 .toc-section-title:hover .toc-chevron,
 .toc-section:not(.collapsed) > .toc-section-title .toc-chevron {
-    color: var(--accent);
+    background-color: var(--accent);
 }
 
 /* Collapsed state hides the subsection list. Search overrides this
@@ -1578,11 +1566,17 @@ body.auth-page {
         border-color: var(--accent);
     }
 
+    /* Caret indicator on the mobile account toggle. Uses the shared
+       icon file as a mask so it inherits theme color via currentColor. */
     .account-toggle::after {
-        content: "\25BE";
-        margin-left: 6px;
-        font-size: 10px;
+        content: "";
         display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-left: 6px;
+        background-color: currentColor;
+        -webkit-mask: url("/static/icons/caret.svg") no-repeat center / contain;
+                mask: url("/static/icons/caret.svg") no-repeat center / contain;
         transition: transform .15s ease;
     }
 
@@ -1646,10 +1640,12 @@ body.auth-page {
         -moz-appearance: none;
         appearance: none;
         padding: 0 32px;
-        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='%239a9db0'><path d='M6 8 0 0h12z'/></svg>");
+        /* Same caret.svg path baked in (background-image can't honor
+           currentColor; <select> can't easily be mask-imaged). */
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 640' fill='%239a9db0'><path d='M160 352C147.1 352 135.4 359.8 130.4 371.8C125.4 383.8 128.2 397.5 137.4 406.6L297.4 566.6C309.9 579.1 330.2 579.1 342.7 566.6L502.7 406.6C511.9 397.4 514.6 383.7 509.6 371.7C504.6 359.7 492.9 352 480 352L160 352z'/></svg>");
         background-repeat: no-repeat;
         background-position: right 12px center;
-        background-size: 10px;
+        background-size: 11px;
         text-align-last: center;
     }
 

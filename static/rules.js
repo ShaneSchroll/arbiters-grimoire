@@ -46,7 +46,7 @@ async function init() {
     wireMobileSidebar();
 }
 
-/* ---------- data shaping ---------- */
+/*  data shaping  */
 
 function ruleSortKey(r) {
     // "509.2a" → [509, 2, "a"]; lets us sort 100.2 < 100.10 properly.
@@ -84,7 +84,7 @@ function groupRules(docs) {
     return tree;
 }
 
-/* ---------- escaping + inline rendering (anchorized) ---------- */
+/*  escaping + inline rendering (anchorized)  */
 
 function escapeHtml(s) {
     return s.replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
@@ -139,7 +139,7 @@ function renderRuleBody(text) {
         .join("");
 }
 
-/* ---------- TOC ---------- */
+/*  TOC  */
 
 function buildToc(tree, docs) {
     const parts = [];
@@ -154,7 +154,9 @@ function buildToc(tree, docs) {
                 '<button class="toc-section-title" type="button" ' +
                         'aria-expanded="false" ' +
                         'aria-controls="toc-subs-' + secId + '">' +
-                    '<span class="toc-chevron" aria-hidden="true">▸</span>' +
+                    // Empty span; styled as a mask-image in CSS so we can
+                    // theme the color and rotate it on collapse state.
+                    '<span class="toc-chevron" aria-hidden="true"></span>' +
                     '<span class="toc-num">' + secId + '.</span> ' +
                     escapeHtml(sec.title) +
                 '</button>' +
@@ -177,7 +179,7 @@ function buildToc(tree, docs) {
     tocEl.innerHTML = parts.join("");
 }
 
-/* ---------- main content ---------- */
+/*  main content  */
 
 function buildContent(tree, docs) {
     const parts = [];
@@ -219,7 +221,7 @@ function buildContent(tree, docs) {
     contentEl.innerHTML = parts.join("");
 }
 
-/* ---------- search ---------- */
+/*  search  */
 
 let searchTimer = null;
 function wireSearch(docs) {
@@ -291,7 +293,7 @@ function runSearch(rawQuery) {
     highlightMatches(q);
 }
 
-/* ---------- highlighting ---------- */
+/*  highlighting  */
 
 function clearHighlights() {
     contentEl.querySelectorAll("mark.search-hit").forEach(m => {
@@ -343,7 +345,7 @@ function wrapMatches(textNode, lower) {
     textNode.parentNode.replaceChild(frag, textNode);
 }
 
-/* ---------- scroll spy + URL hash ---------- */
+/*  scroll spy + URL hash  */
 
 function wireScrollSpy() {
     if (!("IntersectionObserver" in window)) return;
@@ -403,7 +405,7 @@ function scrollToRule(rule) {
     setTimeout(() => el.classList.remove("flash"), 1400);
 }
 
-/* ---------- collapsible TOC sections ---------- */
+/*  collapsible TOC sections  */
 
 // Delegated handler: clicking a section title toggles its .collapsed
 // state. CSS handles the chevron rotation and the subsection visibility.
@@ -419,7 +421,7 @@ function wireSectionCollapse() {
     });
 }
 
-/* ---------- mobile sidebar drawer ---------- */
+/*  mobile sidebar drawer  */
 
 // On mobile (<=900px) the sidebar is hidden behind a fixed toggle button
 // and slides in over the content with a dimmed backdrop. Desktop ignores
