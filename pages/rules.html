@@ -28,7 +28,7 @@
                 type="button"
                 aria-expanded="false"
                 aria-controls="account-menu">
-                Account
+                Menu
             </button>
 
             <div id="account-menu" class="account-menu">
@@ -46,7 +46,22 @@
         </header>
 
         <div class="docs-layout">
-            <aside class="docs-sidebar" aria-label="Rules navigation">
+            <!-- Mobile-only drawer trigger. Hidden on desktop via CSS. -->
+            <button
+                id="docs-sidebar-toggle"
+                class="docs-sidebar-toggle"
+                type="button"
+                aria-label="Open rules navigation"
+                aria-expanded="false"
+                aria-controls="docs-sidebar">
+                <span class="docs-toggle-icon" aria-hidden="true">☰</span>
+                <span class="docs-toggle-label">Rules</span>
+            </button>
+
+            <!-- Backdrop shown only when the mobile drawer is open. -->
+            <div id="docs-backdrop" class="docs-backdrop" aria-hidden="true"></div>
+
+            <aside id="docs-sidebar" class="docs-sidebar" aria-label="Rules navigation">
                 <div class="docs-search-wrap">
                     <input
                         id="docs-search"

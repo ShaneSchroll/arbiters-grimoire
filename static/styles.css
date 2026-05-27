@@ -508,7 +508,7 @@ header select {
 }
 
 .tips-main-content > * {
-    max-width: 760px;
+    max-width: 920px;
     margin-left: auto;
     margin-right: auto;
 }
@@ -518,7 +518,7 @@ header select {
 }
 
 .codex-hero {
-    max-width: 760px;
+    max-width: 920px;
     margin: 0 auto 46px;
 }
 
@@ -526,7 +526,7 @@ header select {
     display: inline-flex;
     align-items: center;
     gap: 10px;
-    color: var(--muted);
+    color: var(--accent);
     font-size: 12px;
     letter-spacing: 0.22em;
     text-transform: uppercase;
@@ -534,19 +534,9 @@ header select {
     margin-bottom: 14px;
 }
 
-.codex-eyebrow::before {
-    content: "";
-    width: 22px;
-    height: 1px;
-    background: var(--accent);
-}
-
-.codex-eyebrow .accent { color: var(--accent); }
-.codex-eyebrow .dot { color: var(--muted-2); }
-
 .codex-title {
     font-family: var(--serif);
-    font-weight: 600;
+    font-weight: 500;
     font-size: 56px;
     line-height: 1.04;
     letter-spacing: -0.025em;
@@ -558,14 +548,14 @@ header select {
 .codex-title em {
     font-style: italic;
     color: var(--accent);
-    font-weight: 500;
+    font-weight: 800;
+    font-family: var(--serif);
 }
 
 .codex-lede {
     font-size: 17px;
     line-height: 1.65;
     color: var(--muted);
-    max-width: 580px;
     margin: 0;
     text-wrap: pretty;
 }
@@ -1097,18 +1087,60 @@ header select {
     padding: 6px 0;
 }
 
-.toc-section-title a {
-    display: block;
+/* Section title is now a button (clicking toggles its subsections).
+   Resets browser button chrome so it reads as a TOC heading. */
+.toc-section-title {
+    display: flex;
+    align-items: center;
+    width: 100%;
     padding: 6px 16px;
+    background: none;
+    border: 0;
     color: var(--text);
+    font: inherit;
     font-weight: 600;
-    text-decoration: none;
     font-size: 13px;
     letter-spacing: .2px;
+    text-align: left;
+    cursor: pointer;
+    transition: color .12s ease;
 }
 
-.toc-section-title a:hover {
+.toc-section-title:hover,
+.toc-section-title:focus-visible {
     color: var(--accent);
+    outline: none;
+}
+
+/* Chevron rotates when the section is expanded. Default state (collapsed)
+   points right; expanded points down. Width keeps the heading text aligned. */
+.toc-chevron {
+    display: inline-block;
+    width: 14px;
+    margin-right: 4px;
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 1;
+    transition: transform .15s ease;
+}
+
+.toc-section:not(.collapsed) > .toc-section-title .toc-chevron {
+    transform: rotate(90deg);
+}
+
+.toc-section-title:hover .toc-chevron,
+.toc-section:not(.collapsed) > .toc-section-title .toc-chevron {
+    color: var(--accent);
+}
+
+/* Collapsed state hides the subsection list. Search overrides this
+   below so matches stay visible without manual expansion. */
+.toc-section.collapsed > .toc-subsections {
+    display: none;
+}
+
+.docs-toc.searching .toc-section > .toc-subsections {
+    display: block;
 }
 
 .toc-subsections {
@@ -1116,7 +1148,7 @@ header select {
     margin: 2px 0 6px;
     padding: 0;
     border-left: 1px solid var(--line);
-    margin-left: 22px;
+    margin-left: 26px;  /* aligned past the chevron + section number */
 }
 
 .toc-subsection {
@@ -1289,16 +1321,19 @@ mark.search-hit {
     100% { background: transparent; }
 }
 
+/* Mobile-only drawer trigger + backdrop. Hidden on desktop. */
+.docs-sidebar-toggle {
+    display: none;
+}
+
+.docs-backdrop {
+    display: none;
+}
+
 @media (max-width: 900px) {
     .docs-layout {
         grid-template-columns: 1fr;
         overflow: visible;
-    }
-    .docs-sidebar {
-        position: static;
-        max-height: 40vh;
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
     }
     .docs-main {
         padding: 22px 18px 60px;
@@ -1306,6 +1341,71 @@ mark.search-hit {
     .docs-rule {
         grid-template-columns: 56px 1fr;
         gap: 10px;
+    }
+
+    /* Sidebar becomes a left drawer. Hidden off-screen by default;
+       .open slides it in. Sits above content + backdrop. */
+    .docs-sidebar {
+        position: fixed;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 85vw;
+        max-width: 340px;
+        z-index: 60;
+        border-right: 1px solid var(--line);
+        border-bottom: 0;
+        transform: translateX(-100%);
+        transition: transform .22s ease;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+    }
+
+    .docs-sidebar.open {
+        transform: translateX(0);
+    }
+
+    /* Backdrop is interactive only when the drawer is open. */
+    .docs-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 55;
+        background: rgba(0, 0, 0, .55);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity .2s ease;
+    }
+
+    .docs-backdrop.open {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    /* Fixed bottom-left FAB that opens the drawer. Sits inside the
+       thumb zone on phones; doesn't overlap meaningful content. */
+    .docs-sidebar-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        position: fixed;
+        bottom: 18px;
+        left: 18px;
+        z-index: 50;
+        padding: 10px 14px;
+        background: var(--accent);
+        color: #1a1407;
+        border: none;
+        border-radius: 999px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, .45);
+    }
+
+    .docs-toggle-icon {
+        font-size: 16px;
+        line-height: 1;
     }
 }
 

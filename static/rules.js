@@ -42,6 +42,8 @@ async function init() {
     wireSearch(docs);
     wireScrollSpy();
     wireXrefClicks();
+    wireSectionCollapse();
+    wireMobileSidebar();
 }
 
 /* ---------- data shaping ---------- */
@@ -144,15 +146,19 @@ function buildToc(tree, docs) {
     const sectionIds = Object.keys(tree).sort();
     for (const secId of sectionIds) {
         const sec = tree[secId];
+        // Sections start collapsed: cleaner first impression, user picks
+        // which area to drill into. Search auto-expands all via the
+        // .docs-toc.searching class so matches stay visible.
         parts.push(
-            '<div class="toc-section" data-section="' + secId + '">' +
-                '<div class="toc-section-title">' +
-                    '<a href="#section-' + secId + '">' +
-                        '<span class="toc-num">' + secId + '.</span> ' +
-                        escapeHtml(sec.title) +
-                    '</a>' +
-                '</div>' +
-                '<ul class="toc-subsections">'
+            '<div class="toc-section collapsed" data-section="' + secId + '">' +
+                '<button class="toc-section-title" type="button" ' +
+                        'aria-expanded="false" ' +
+                        'aria-controls="toc-subs-' + secId + '">' +
+                    '<span class="toc-chevron" aria-hidden="true">▸</span>' +
+                    '<span class="toc-num">' + secId + '.</span> ' +
+                    escapeHtml(sec.title) +
+                '</button>' +
+                '<ul class="toc-subsections" id="toc-subs-' + secId + '">'
         );
         const subIds = Object.keys(sec.subsections).sort();
         for (const subId of subIds) {
@@ -230,6 +236,11 @@ function wireSearch(docs) {
 
 function runSearch(rawQuery) {
     const q = rawQuery.trim().toLowerCase();
+    // When searching, CSS rule `.docs-toc.searching ... { display: block }`
+    // overrides .collapsed so users see matching subsections without
+    // having to expand sections manually first.
+    tocEl.classList.toggle("searching", !!q);
+
     const rules = contentEl.querySelectorAll(".docs-rule");
     const subs  = contentEl.querySelectorAll(".docs-subsection");
     const secs  = contentEl.querySelectorAll(".docs-section");
@@ -390,6 +401,66 @@ function scrollToRule(rule) {
     el.scrollIntoView({ behavior: "smooth", block: "start" });
     el.classList.add("flash");
     setTimeout(() => el.classList.remove("flash"), 1400);
+}
+
+/* ---------- collapsible TOC sections ---------- */
+
+// Delegated handler: clicking a section title toggles its .collapsed
+// state. CSS handles the chevron rotation and the subsection visibility.
+function wireSectionCollapse() {
+    tocEl.addEventListener("click", e => {
+        const title = e.target.closest(".toc-section-title");
+        if (!title) return;
+        const section = title.closest(".toc-section");
+        if (!section) return;
+        const willCollapse = !section.classList.contains("collapsed");
+        section.classList.toggle("collapsed", willCollapse);
+        title.setAttribute("aria-expanded", String(!willCollapse));
+    });
+}
+
+/* ---------- mobile sidebar drawer ---------- */
+
+// On mobile (<=900px) the sidebar is hidden behind a fixed toggle button
+// and slides in over the content with a dimmed backdrop. Desktop ignores
+// the .open class entirely - the sidebar is always visible in the grid.
+function wireMobileSidebar() {
+    const toggle  = document.getElementById("docs-sidebar-toggle");
+    const sidebar = document.getElementById("docs-sidebar");
+    const backdrop = document.getElementById("docs-backdrop");
+    if (!toggle || !sidebar || !backdrop) return;
+
+    function setOpen(open) {
+        sidebar.classList.toggle("open", open);
+        backdrop.classList.toggle("open", open);
+        toggle.setAttribute("aria-expanded", String(open));
+        backdrop.setAttribute("aria-hidden", String(!open));
+    }
+
+    toggle.addEventListener("click", () => {
+        setOpen(!sidebar.classList.contains("open"));
+    });
+    backdrop.addEventListener("click", () => setOpen(false));
+
+    // Tapping a subsection link auto-closes the drawer so the user lands
+    // on the content they picked instead of staring at the TOC.
+    sidebar.addEventListener("click", e => {
+        if (e.target.closest(".toc-sub-link")) setOpen(false);
+    });
+
+    // Escape closes the drawer when it's open.
+    document.addEventListener("keydown", e => {
+        if (e.key === "Escape" && sidebar.classList.contains("open")) {
+            setOpen(false);
+            toggle.focus();
+        }
+    });
+
+    // If the viewport grows back to desktop while the drawer is open,
+    // strip the open state so the desktop layout isn't stuck with a
+    // backdrop visible.
+    const mq = window.matchMedia("(min-width: 901px)");
+    mq.addEventListener("change", e => { if (e.matches) setOpen(false); });
 }
 
 })();   // end IIFE
