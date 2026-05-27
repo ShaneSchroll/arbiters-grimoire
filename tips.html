@@ -51,33 +51,24 @@
             </div>
         </header>
 
-        <div id="chat">
-            <div class="wrap" id="messages">
-                <div class="empty" id="empty">
-                    <h2>Ask a Magic: The Gathering rules question.</h2>
-                    <p>Answers are grounded in the official Magic: The Gathering Rulebook.</p>
+        <div class="tips-main-content">
+            <h2>The Oracle: Tips</h2>
 
-                    <div class="examples">
-                        <button>If I use Animate Land on a Forest, what will its creature type be?</button>
-                        <button>How do first strike and deathtouch interact in combat?</button>
-                        <button>Explain the layer system for continuous effects.</button>
-                    </div>
-                </div>
-            </div>
+            <h3 class="tip-number">For more detailed rulings give the bot a board state along with the question.</h3>
+
+            <p>
+                Providing the board state improves reasoning as triggers and state interactions are very specific and will be explained along with the ruling.<br/><br/> <strong>Example:</strong><br/>
+
+                "My board state: I have 5 Forests in play, Scute Swarm in play, and Roiling Regrowth on the stack. Do I get 2 copies of Scute Swarm since Roiling Regrowth resolves before the Scute Swarm trigger or do I get 1 insect and 1 copy based on lands in play when I played Roiling Regrowth, triggering Scute Swarm as each land comes into play?"
+            </p>
+
+            <p>The Oracle will then break-down the order in which items trigger and resolve and how the board state progresses while explaining each one.</p>
+
+            <div class="divider"></div>
+
+            <h3>Capitalize Card Names</h3>
+            <p>Capitalizing card names helps the bot determine named cards to perform an oracle text lookup for accurate rulings.</p>
         </div>
 
-        <footer>
-            <div class="wrap">
-                <div class="inputrow">
-                    <textarea id="input" rows="1"
-                    placeholder="Ask a rules question…"></textarea>
-                    <button class="send" id="send">Fact or Fiction</button>
-                </div>
-            </div>
-        </footer>
-
-        <div class="disclosure">
-            <p>This site is not affiliated with, endorsed by, or sponsored by Wizards of the Coast &trade;.</p>
-        </div>
     </body>
 </html>

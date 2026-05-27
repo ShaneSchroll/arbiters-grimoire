@@ -143,6 +143,48 @@ select {
     border-top: 1px solid var(--line);
 }
 
+/* Tables can be wider than the bubble; let them scroll horizontally
+   without breaking border-collapse on the table itself. */
+.bot .bubble .table-wrap {
+    margin: 10px 0;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+}
+
+.bot .bubble table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13.5px;
+}
+
+.bot .bubble th,
+.bot .bubble td {
+    border-bottom: 1px solid var(--line);
+    padding: 7px 10px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.bot .bubble th + th,
+.bot .bubble td + td {
+    border-left: 1px solid var(--line);
+}
+
+.bot .bubble th {
+    background: var(--panel-2);
+    color: var(--text);
+    font-weight: 600;
+}
+
+.bot .bubble tbody tr:nth-child(even) td {
+    background: rgba(255, 255, 255, .02);
+}
+
+.bot .bubble tbody tr:last-child td {
+    border-bottom: 0;
+}
+
 .bot .bubble h3,
 .bot .bubble h4,
 .bot .bubble h5,
@@ -400,41 +442,127 @@ button.send:disabled {
 
 @keyframes b { 0%,80%,100%{opacity:.3} 40%{opacity:1} }
 
-.rulebook-link {
-    background: rgb(74, 120, 200);
+/* Unified header controls. All four button-shaped items (Rulebook,
+   How To Use, model picker, Logout) share the same pill so the header
+   reads as one toolbar instead of a row of mismatched buttons. Mobile
+   rules inside the @media block override these into the stacked popup. */
+.rulebook-link,
+.tips-link,
+header select,
+button.logout {
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 0 12px;
+    background: var(--panel-2);
     color: var(--text);
     border: 1px solid var(--line);
     border-radius: 7px;
-    padding: 5px 10px;
-    font-size: 14px;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
     text-decoration: none;
+    cursor: pointer;
+    transition: border-color .15s ease, color .15s ease;
+}
+
+.rulebook-link:hover,
+.tips-link:hover,
+header select:hover,
+button.logout:hover,
+.rulebook-link:focus-visible,
+.tips-link:focus-visible,
+header select:focus-visible,
+button.logout:focus-visible {
+    border-color: var(--accent);
+    outline: none;
+}
+
+/* The Tips link is the gold accent in the toolbar - marks it as
+   "learn how to use this" so it stands out a touch from the neutral
+   external/control items. */
+.tips-link {
+    color: var(--accent);
+}
+
+/* Custom dropdown arrow so the select matches the button pills instead
+   of falling back to the OS-native select chrome. */
+header select {
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    padding-right: 28px;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='%239a9db0'><path d='M6 8 0 0h12z'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 9px;
+}
+
+/* Tips / how-to page. Takes the space below the shared header, scrolls
+   independently, and uses the same 780px reading column as the chat. */
+.tips-main-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 32px 22px 48px;
+    max-width: 780px;
+    width: 100%;
+    margin: 0 auto;
+    color: var(--text);
+}
+
+.tips-main-content h2 {
+    font-size: 32px;
+    margin-bottom: 16px;
+}
+
+.tips-main-content h3 {
+    color: var(--accent);
+    font-size: 20px;
+    font-weight: 700;
+    margin-top: 22px;
+    margin-bottom: 8px;
+}
+
+.tips-main-content p {
+    color: var(--text);
+    font-size: 16px;
+    line-height: 1.7;
+    margin-bottom: 16px;
+}
+
+.tips-main-content .divider {
+    display: block;
+    width: 100%;
+    height: 1px;
+    background-color: rgba(200, 162, 74, 0.3);
+    margin: 8px 0;
 }
 
 /**
   * Login/Logout buttons
 */
 
+/* Signed-in email. Sits between the model picker and Logout with a
+   thin divider on its left, so the email + Log out read as one
+   "you're signed in" group rather than two loose items in the toolbar.
+   The 32px height + flex alignment matches the pill controls so the
+   divider runs the full height of its neighbors.
+   Mobile (.account-menu #who) overrides these to render as a label
+   at the top of the popup; it also resets border-left below. */
 #who {
+    display: inline-flex;
+    align-items: center;
+    height: 32px;
+    max-width: 220px;
+    padding-left: 14px;
+    border-left: 1px solid var(--line);
     color: var(--muted);
     font-size: 13px;
-    max-width: 200px;
+    line-height: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-
-button.logout {
-    background: var(--panel-2);
-    color: var(--text);
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    padding: 5px 10px;
-    font-size: 14px;
-    cursor: pointer;
-}
-
-button.logout:hover {
-    border-color: var(--accent);
 }
 
 /**
@@ -652,7 +780,8 @@ body.auth-page {
     /* Identical sizing/style for popup items */
     .account-menu .rulebook-link,
     .account-menu button.logout,
-    .account-menu select {
+    .account-menu select,
+    .account-menu .tips-link {
         display: block;
         width: 100%;
         box-sizing: border-box;
@@ -672,7 +801,8 @@ body.auth-page {
 
     .account-menu .rulebook-link:hover,
     .account-menu button.logout:hover,
-    .account-menu select:hover {
+    .account-menu select:hover,
+    .account-menu .tips-link:hover {
         border-color: var(--accent);
     }
 
@@ -688,10 +818,16 @@ body.auth-page {
         text-align-last: center;
     }
 
-    /* Signed-in email becomes a small label at the top of the popup. */
+    /* Signed-in email becomes a small label at the top of the popup.
+       Resets the desktop pill height + left-divider so the popup label
+       reads as a plain header, not a control. */
     .account-menu #who {
+        display: block;
         order: -1;
+        height: auto;
         max-width: 100%;
+        padding-left: 0;
+        border-left: 0;
         font-size: 12px;
         color: var(--muted);
         text-align: left;

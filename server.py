@@ -18,6 +18,7 @@ Behind a proxy (Render):
   so that request.url.scheme reports https and cookies get the Secure flag.
 """
 
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -26,7 +27,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -62,10 +63,11 @@ def find_index_html() -> Path:
 
 
 INDEX_HTML = find_index_html()
+TIPS_HTML = BASE_DIR / "tips.html"
 AUTH_PAGES = BASE_DIR / "auth_pages"
 
-# Models available in the dropdown. Opus is the default for the hardest rules
-# interactions; Sonnet is faster and cheaper for everyday questions.
+# Models available in the dropdown. Sonnet is the default - faster and cheaper
+# for everyday questions; Opus is opt-in via the dropdown for hard questions.
 ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-7"}
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
@@ -145,6 +147,11 @@ def filter_sources(answer: str, sources: list) -> list:
     return used[:MAX_SOURCES]
 
 
+def _sse(payload: dict) -> str:
+    """Encode one Server-Sent Event with a JSON data field."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest, _user=Depends(auth.require_user)):
     model = req.model if req.model in ALLOWED_MODELS else DEFAULT_MODEL
@@ -156,46 +163,61 @@ def chat(req: ChatRequest, _user=Depends(auth.require_user)):
     system, sources = build_system(last_user)
     messages = [{"role": m["role"], "content": m["content"]} for m in req.messages]
 
-    # Tool loop: keep calling Claude until it produces a final answer.
-    for _ in range(6):  # safety cap on tool round-trips
-        resp = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=system,
-            tools=[CARD_TOOL],
-            messages=messages,
-        )
+    def event_stream():
+        """Server-Sent Events: delta chunks during generation, then a final
+        'done' event carrying the filtered sources. The tool loop continues
+        between streamed rounds - text from "let me look that up" rounds is
+        streamed too, so the user sees what's happening live."""
+        answer_parts: list[str] = []
+        try:
+            for _ in range(6):  # safety cap on tool round-trips
+                with client.messages.stream(
+                    model=model,
+                    max_tokens=2048,
+                    system=system,
+                    tools=[CARD_TOOL],
+                    messages=messages,
+                ) as stream:
+                    for chunk in stream.text_stream:
+                        answer_parts.append(chunk)
+                        yield _sse({"type": "delta", "text": chunk})
+                    final = stream.get_final_message()
 
-        if resp.stop_reason != "tool_use":
-            answer = "".join(
-                b.text for b in resp.content if b.type == "text"
-            )
-            return {
-                "answer": answer,
-                "sources": filter_sources(answer, sources),
-                "model": model,
-            }
+                if final.stop_reason != "tool_use":
+                    full = "".join(answer_parts)
+                    yield _sse({
+                        "type": "done",
+                        "sources": filter_sources(full, sources),
+                        "model": model,
+                    })
+                    return
 
-        # Run every card lookup Claude requested, then loop back.
-        messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
-        for block in resp.content:
-            if block.type == "tool_use" and block.name == "lookup_card":
-                result = lookup_card(block.input.get("name", ""))
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(result),
-                    }
-                )
-        messages.append({"role": "user", "content": tool_results})
+                # Tool round-trip: run every card lookup, then loop back.
+                messages.append({"role": "assistant", "content": final.content})
+                tool_results = []
+                for block in final.content:
+                    if block.type == "tool_use" and block.name == "lookup_card":
+                        result = lookup_card(block.input.get("name", ""))
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(result),
+                        })
+                messages.append({"role": "user", "content": tool_results})
 
-    return {
-        "answer": "The assistant exceeded the tool-use limit. Please rephrase.",
-        "sources": sources,
-        "model": model,
-    }
+            yield _sse({
+                "type": "error",
+                "message": "The assistant exceeded the tool-use limit. Please rephrase.",
+            })
+        except Exception:
+            yield _sse({"type": "error", "message": "Server error while generating."})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        # Disable proxy buffering so chunks reach the browser immediately.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/")
@@ -204,6 +226,14 @@ def index(request: Request):
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
     return FileResponse(INDEX_HTML)
+
+
+@app.get("/tips")
+def tips_page(request: Request):
+    user = auth.get_current_user(request)
+    if not user or not user["approved"]:
+        return RedirectResponse("/login", status_code=302)
+    return FileResponse(TIPS_HTML)
 
 
 @app.get("/login")

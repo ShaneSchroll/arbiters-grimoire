@@ -1,4 +1,5 @@
 const history = []; // full conversation sent each turn
+const chatEl = document.getElementById("chat");
 const messagesEl = document.getElementById("messages");
 const emptyEl = document.getElementById("empty");
 const inputEl = document.getElementById("input");
@@ -6,6 +7,15 @@ const sendEl = document.getElementById("send");
 const modelEl = document.getElementById("model");
 const whoEl = document.getElementById("who");
 const logoutEl = document.getElementById("logout");
+
+// Auto-scroll the chat to the bottom, but only if the user is already near
+// the bottom - otherwise streaming deltas yank them away from earlier reading.
+function nearBottom() {
+    return chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 120;
+}
+function scrollChatToBottom(force) {
+    if (force || nearBottom()) chatEl.scrollTop = chatEl.scrollHeight;
+}
 
 // Verify the user is signed in before showing the chat. A missing or
 // expired cookie returns 401 here, which bounces back to the login page.
@@ -81,6 +91,39 @@ function renderInline(escaped) {
 const BLOCK_START = /^(?:#{1,4}\s|[-*+]\s|\d+\.\s|```|-{3,}\s*$)/;
 const HR_LINE = /^-{3,}\s*$/;
 
+// GFM table helpers. A table is a header line containing `|` followed by a
+// separator line of dashes/colons/pipes. Leading/trailing pipes are optional.
+function splitTableRow(line) {
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|"))   s = s.slice(0, -1);
+    return s.split("|").map(c => c.trim());
+}
+
+function isTableSeparator(line) {
+    const s = line.trim();
+    if (!/^[\s:|-]+$/.test(s) || !s.includes("-")) return false;
+    const cells = splitTableRow(s);
+    return cells.length >= 1 && cells.every(c => /^:?-+:?$/.test(c));
+}
+
+function columnAlign(sep) {
+    const left = sep.startsWith(":");
+    const right = sep.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return null;
+}
+
+function looksLikeTableStart(lines, i) {
+    return (
+        i + 1 < lines.length &&
+        lines[i].includes("|") &&
+        isTableSeparator(lines[i + 1])
+    );
+}
+
 // Minimal block-level markdown: paragraphs (blank-line separated), ATX
 // headings (#..####), unordered/ordered lists, fenced ``` code blocks,
 // plus the inline transforms above. Intentionally small - just enough to
@@ -112,6 +155,42 @@ function render(text) {
         if (HR_LINE.test(stripped)) {
             out.push("<hr>");
             i++;
+            continue;
+        }
+
+        // GFM table: header row, separator, then body rows. Wrapped in a
+        // scroll container so wide tables don't blow out the bubble width.
+        if (looksLikeTableStart(lines, i)) {
+            const headers = splitTableRow(lines[i]);
+            const aligns  = splitTableRow(lines[i + 1]).map(columnAlign);
+            i += 2;
+            const rows = [];
+            while (
+                i < lines.length &&
+                lines[i].trim() &&
+                lines[i].includes("|") &&
+                !BLOCK_START.test(lines[i])
+            ) {
+                rows.push(splitTableRow(lines[i]));
+                i++;
+            }
+
+            const styleFor = idx =>
+                aligns[idx] ? ' style="text-align:' + aligns[idx] + '"' : "";
+            const cell = (tag, text, idx) =>
+                "<" + tag + styleFor(idx) + ">" +
+                renderInline(escapeHtml(text)) + "</" + tag + ">";
+
+            let html = '<div class="table-wrap"><table><thead><tr>';
+            headers.forEach((h, idx) => { html += cell("th", h, idx); });
+            html += "</tr></thead><tbody>";
+            rows.forEach(row => {
+                html += "<tr>";
+                row.forEach((c, idx) => { html += cell("td", c, idx); });
+                html += "</tr>";
+            });
+            html += "</tbody></table></div>";
+            out.push(html);
             continue;
         }
 
@@ -155,12 +234,14 @@ function render(text) {
         // Blank line - paragraph separator
         if (!stripped) { i++; continue; }
 
-        // Paragraph: gather contiguous lines until blank or a new block.
+        // Paragraph: gather contiguous lines until blank, a new block, or a
+        // table start (header + separator) that wasn't preceded by a blank.
         const para = [];
         while (
             i < lines.length &&
             lines[i].trim() &&
-            !BLOCK_START.test(lines[i])
+            !BLOCK_START.test(lines[i]) &&
+            !looksLikeTableStart(lines, i)
         ) {
             para.push(lines[i].trim());
             i++;
@@ -283,6 +364,23 @@ async function send() {
     const thinking = addMessage("bot", "");
     thinking.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>';
 
+    let accumulated = "";
+    let sources = null;
+    let firstDelta = true;
+    let renderPending = false;
+
+    // Re-render the bot bubble at most once per animation frame even if
+    // deltas arrive in bursts. Keeps DOM churn cheap on long responses.
+    function scheduleRender() {
+        if (renderPending) return;
+        renderPending = true;
+        requestAnimationFrame(() => {
+            renderPending = false;
+            thinking.innerHTML = render(accumulated);
+            scrollChatToBottom();
+        });
+    }
+
     try {
         const res = await fetch("/api/chat", {
             method: "POST",
@@ -294,11 +392,52 @@ async function send() {
             window.location.href = "/login";
             return;
         }
+        if (!res.ok || !res.body) {
+            throw new Error("Bad response: " + res.status);
+        }
 
-        const data = await res.json();
-        thinking.innerHTML = render(data.answer || "(no answer)");
-        appendSources(thinking, data.sources);
-        history.push({ role: "assistant", content: data.answer || "" });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        // Parse Server-Sent Events: "data: <json>\n\n" frames.
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            let idx;
+            while ((idx = buffer.indexOf("\n\n")) !== -1) {
+                const frame = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                const dataLine = frame.split("\n").find(l => l.startsWith("data:"));
+                if (!dataLine) continue;
+
+                let evt;
+                try { evt = JSON.parse(dataLine.slice(5).trim()); }
+                catch { continue; }
+
+                if (evt.type === "delta") {
+                    if (firstDelta) {
+                        thinking.innerHTML = "";
+                        firstDelta = false;
+                    }
+                    accumulated += evt.text;
+                    scheduleRender();
+                } else if (evt.type === "done") {
+                    sources = evt.sources;
+                } else if (evt.type === "error") {
+                    accumulated += (accumulated ? "\n\n" : "") + "*" + evt.message + "*";
+                    scheduleRender();
+                }
+            }
+        }
+
+        // Final synchronous render so sources land on the fully-rendered text.
+        thinking.innerHTML = render(accumulated || "(no answer)");
+        appendSources(thinking, sources);
+        scrollChatToBottom();
+        history.push({ role: "assistant", content: accumulated });
     } catch (e) {
         thinking.innerHTML = "Error reaching the server. Is it running?";
     } finally {
@@ -307,18 +446,23 @@ async function send() {
     }
 }
 
-sendEl.onclick = send;
-inputEl.addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault(); send();
-    }
-});
+// Chat-only wiring. The same bundle also loads on /tips, which has the
+// header (account menu, logout, auth-check) but no chat surface - so guard
+// on the chat root before attaching anything that touches input/send.
+if (chatEl && inputEl && sendEl) {
+    sendEl.onclick = send;
+    inputEl.addEventListener("keydown", e => {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault(); send();
+        }
+    });
 
-inputEl.addEventListener("input", () => {
-    inputEl.style.height = "auto";
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
-});
+    inputEl.addEventListener("input", () => {
+        inputEl.style.height = "auto";
+        inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
+    });
 
-document.querySelectorAll(".examples button").forEach(b => {
-    b.onclick = () => { inputEl.value = b.textContent; send(); };
-});
+    document.querySelectorAll(".examples button").forEach(b => {
+        b.onclick = () => { inputEl.value = b.textContent; send(); };
+    });
+}
