@@ -543,13 +543,6 @@ header select {
   * Login/Logout buttons
 */
 
-/* Signed-in email. Sits between the model picker and Logout with a
-   thin divider on its left, so the email + Log out read as one
-   "you're signed in" group rather than two loose items in the toolbar.
-   The 32px height + flex alignment matches the pill controls so the
-   divider runs the full height of its neighbors.
-   Mobile (.account-menu #who) overrides these to render as a label
-   at the top of the popup; it also resets border-left below. */
 #who {
     display: inline-flex;
     align-items: center;
@@ -717,7 +710,7 @@ body.auth-page {
   * Mobile tweaks (phones in portrait and small landscape)
 */
 
-@media (max-width: 640px) {
+@media (max-width: 860px) {
     header {
         padding: 10px 14px;
         gap: 10px;
@@ -818,9 +811,7 @@ body.auth-page {
         text-align-last: center;
     }
 
-    /* Signed-in email becomes a small label at the top of the popup.
-       Resets the desktop pill height + left-divider so the popup label
-       reads as a plain header, not a control. */
+    /* Signed-in email becomes a small label at the top of the popup */
     .account-menu #who {
         display: block;
         order: -1;
@@ -853,7 +844,7 @@ body.auth-page {
         margin-top: 8vh;
     }
 
-    /* Stack textarea above a full-width send button. */
+    /* Stack textarea above a full-width send button */
     .inputrow {
         flex-direction: column;
         gap: 10px;
