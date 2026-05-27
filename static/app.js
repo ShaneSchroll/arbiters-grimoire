@@ -64,13 +64,111 @@ function escapeHtml(s) {
     return s.replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
 }
 
-// Minimal, safe rendering: escape first, then add bold/code/rule highlights.
-function render(text) {
-    let h = escapeHtml(text);
-    h = h.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+// Inline-only transforms (assumes input is already HTML-escaped).
+// Order matters: code first so backtick contents aren't reinterpreted,
+// then bold (**), then italic (*), then rule-number highlights.
+function renderInline(escaped) {
+    let h = escaped;
     h = h.replace(/`([^`]+)`/g, "<code>$1</code>");
+    h = h.replace(/\*\*([^*]+?)\*\*/g, "<b>$1</b>");
+    h = h.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<i>$2</i>");
     h = h.replace(/\(?\b(\d{3}\.\d+[a-z]?)\)?/g, '<span class="rule">$1</span>');
     return h;
+}
+
+// A line that starts a block element (heading, list item, code fence, or
+// horizontal rule). Used so paragraph collection stops at the next block.
+const BLOCK_START = /^(?:#{1,4}\s|[-*+]\s|\d+\.\s|```|-{3,}\s*$)/;
+const HR_LINE = /^-{3,}\s*$/;
+
+// Minimal block-level markdown: paragraphs (blank-line separated), ATX
+// headings (#..####), unordered/ordered lists, fenced ``` code blocks,
+// plus the inline transforms above. Intentionally small - just enough to
+// render what Claude actually emits in chat. NOT a spec-compliant parser.
+function render(text) {
+    const lines = text.split("\n");
+    const out = [];
+    let i = 0;
+
+    while (i < lines.length) {
+        const line = lines[i];
+        const stripped = line.trim();
+
+        // Fenced code block - render verbatim, no inline transforms inside.
+        if (/^```/.test(stripped)) {
+            i++;
+            const buf = [];
+            while (i < lines.length && !/^```/.test(lines[i].trim())) {
+                buf.push(lines[i]);
+                i++;
+            }
+            i++; // consume closing fence (or run off the end)
+            out.push("<pre><code>" + escapeHtml(buf.join("\n")) + "</code></pre>");
+            continue;
+        }
+
+        // Horizontal rule (---). Checked before lists so it isn't eaten
+        // as a one-character "-" bullet.
+        if (HR_LINE.test(stripped)) {
+            out.push("<hr>");
+            i++;
+            continue;
+        }
+
+        // ATX heading: # → h3, ## → h4, ### → h5, #### → h6
+        const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+        if (heading) {
+            const level = heading[1].length + 2;
+            out.push(
+                "<h" + level + ">" +
+                renderInline(escapeHtml(heading[2].trim())) +
+                "</h" + level + ">"
+            );
+            i++;
+            continue;
+        }
+
+        // Unordered list
+        if (/^[-*+]\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^[-*+]\s+/.test(lines[i])) {
+                const item = lines[i].replace(/^[-*+]\s+/, "");
+                items.push("<li>" + renderInline(escapeHtml(item)) + "</li>");
+                i++;
+            }
+            out.push("<ul>" + items.join("") + "</ul>");
+            continue;
+        }
+
+        // Ordered list
+        if (/^\d+\.\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+                const item = lines[i].replace(/^\d+\.\s+/, "");
+                items.push("<li>" + renderInline(escapeHtml(item)) + "</li>");
+                i++;
+            }
+            out.push("<ol>" + items.join("") + "</ol>");
+            continue;
+        }
+
+        // Blank line - paragraph separator
+        if (!stripped) { i++; continue; }
+
+        // Paragraph: gather contiguous lines until blank or a new block.
+        const para = [];
+        while (
+            i < lines.length &&
+            lines[i].trim() &&
+            !BLOCK_START.test(lines[i])
+        ) {
+            para.push(lines[i].trim());
+            i++;
+        }
+        out.push("<p>" + renderInline(escapeHtml(para.join(" "))) + "</p>");
+    }
+
+    return out.join("");
 }
 
 // Collapse whitespace and clip to max chars; appends an ellipsis if clipped.
@@ -105,7 +203,7 @@ function ruleParagraphs(text) {
 
 function renderRule(text) {
     return ruleParagraphs(text)
-        .map(p => "<p>" + render(p) + "</p>")
+        .map(p => "<p>" + renderInline(escapeHtml(p)) + "</p>")
         .join("");
 }
 

@@ -115,6 +115,8 @@ select {
     background: var(--panel);
     border: 1px solid var(--line);
     border-bottom-left-radius: 3px;
+    /* Renderer emits real <p>/<ul>/<ol>; don't preserve raw newlines. */
+    white-space: normal;
 }
 
 .bot .bubble code {
@@ -122,6 +124,63 @@ select {
     padding: 1px 5px;
     border-radius: 4px;
     font-size: 13px;
+}
+
+/* Block spacing for rendered markdown in bot replies. */
+.bot .bubble > *:first-child { margin-top: 0; }
+.bot .bubble > *:last-child  { margin-bottom: 0; }
+
+.bot .bubble p,
+.bot .bubble ul,
+.bot .bubble ol,
+.bot .bubble pre {
+    margin: 8px 0;
+}
+
+.bot .bubble hr {
+    margin: 14px 0;
+    border: 0;
+    border-top: 1px solid var(--line);
+}
+
+.bot .bubble h3,
+.bot .bubble h4,
+.bot .bubble h5,
+.bot .bubble h6 {
+    margin: 14px 0 6px;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.bot .bubble h3 { font-size: 16px; }
+.bot .bubble h4 { font-size: 15px; }
+.bot .bubble h5,
+.bot .bubble h6 { font-size: 14px; color: var(--muted); }
+
+.bot .bubble ul,
+.bot .bubble ol {
+    padding-left: 22px;
+}
+
+.bot .bubble li + li {
+    margin-top: 4px;
+}
+
+.bot .bubble pre {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-size: 13px;
+    white-space: pre;
+}
+
+.bot .bubble pre code {
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
 }
 
 .rule {
