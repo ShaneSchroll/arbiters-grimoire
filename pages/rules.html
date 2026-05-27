@@ -3,10 +3,11 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width" />
-        <title>The MTG Oracle</title>
+        <title>The MTG Oracle &middot; Rules</title>
         <link rel="icon" type="image/svg+xml" href="/static/dist/favicon.svg" />
         <link rel="stylesheet" href="/static/dist/styles-dist.css" />
         <script src="/static/dist/app-dist.js" defer></script>
+        <script src="/static/dist/rules-dist.js" defer></script>
     </head>
 
     <body>
@@ -44,33 +45,27 @@
             </div>
         </header>
 
-        <div id="chat">
-            <div class="wrap" id="messages">
-                <div class="empty" id="empty">
-                    <h2>Ask a Magic: The Gathering rules question.</h2>
-                    <p>Answers are grounded in the official Magic: The Gathering Rulebook.</p>
-
-                    <div class="examples">
-                        <button>If I use Animate Land on a Forest, what will its creature type be?</button>
-                        <button>How do first strike and deathtouch interact in combat?</button>
-                        <button>Explain the layer system for continuous effects.</button>
-                    </div>
+        <div class="docs-layout">
+            <aside class="docs-sidebar" aria-label="Rules navigation">
+                <div class="docs-search-wrap">
+                    <input
+                        id="docs-search"
+                        class="docs-search"
+                        type="search"
+                        placeholder="Search rules…"
+                        autocomplete="off"
+                        spellcheck="false" />
                 </div>
-            </div>
-        </div>
+                <nav id="docs-toc" class="docs-toc" aria-label="Table of contents">
+                    <div class="docs-loading">Loading rules…</div>
+                </nav>
+            </aside>
 
-        <footer>
-            <div class="wrap">
-                <div class="inputrow">
-                    <textarea id="input" rows="1"
-                    placeholder="Ask a rules question…"></textarea>
-                    <button class="send" id="send">Fact or Fiction</button>
+            <main class="docs-main" id="docs-main">
+                <div class="docs-content" id="docs-content">
+                    <div class="docs-loading">Loading rules…</div>
                 </div>
-            </div>
-        </footer>
-
-        <div class="disclosure">
-            <p>This site is not affiliated with, endorsed by, or sponsored by Wizards of the Coast &trade;.</p>
+            </main>
         </div>
     </body>
 </html>

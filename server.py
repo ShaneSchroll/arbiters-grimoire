@@ -26,7 +26,8 @@ from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -63,7 +64,10 @@ def find_index_html() -> Path:
 
 
 INDEX_HTML = find_index_html()
-TIPS_HTML = BASE_DIR / "tips.html"
+PAGES_DIR = BASE_DIR / "pages"
+TIPS_HTML = PAGES_DIR / "tips.html"
+RULES_HTML = PAGES_DIR / "rules.html"
+DOCS_JSON = BASE_DIR / "docs.json"
 AUTH_PAGES = BASE_DIR / "auth_pages"
 
 # Models available in the dropdown. Sonnet is the default - faster and cheaper
@@ -96,6 +100,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MTG Rules Oracle", lifespan=lifespan)
+# Gzip JSON / HTML over the wire. Big win for docs.json (~1MB → ~360KB),
+# negligible cost. minimum_size skips tiny payloads that wouldn't benefit.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(auth.router)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
@@ -228,12 +235,33 @@ def index(request: Request):
     return FileResponse(INDEX_HTML)
 
 
-@app.get("/tips")
+@app.get("/pages/tips")
 def tips_page(request: Request):
     user = auth.get_current_user(request)
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
     return FileResponse(TIPS_HTML)
+
+
+@app.get("/pages/rules")
+def rules_page(request: Request):
+    user = auth.get_current_user(request)
+    if not user or not user["approved"]:
+        return RedirectResponse("/login", status_code=302)
+    return FileResponse(RULES_HTML)
+
+
+@app.get("/docs.json")
+def docs_json(_user=Depends(auth.require_user)):
+    """Powers the in-app rules docs page. Auth-gated like /api/chat -
+    don't ship the cleaned rulebook to anonymous visitors. GZipMiddleware
+    above compresses the ~1MB JSON down to ~360KB on the wire."""
+    if not DOCS_JSON.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="docs.json is missing. Run `python ingest.py <pdf>` to generate it.",
+        )
+    return FileResponse(DOCS_JSON, media_type="application/json")
 
 
 @app.get("/login")

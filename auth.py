@@ -1,21 +1,5 @@
 """
 auth.py - Authentication for the MTG Rules Oracle.
-
-Design choices:
-  * SQLite, single file. Survives across restarts as long as the host has a
-    persistent disk (Fly volumes, Render disks, your laptop). On an ephemeral
-    filesystem the DB is wiped on redeploy - mount a volume in production.
-  * argon2id for password hashing.
-  * Server-side sessions: a random 256-bit token is set as an HttpOnly cookie,
-    and only the SHA-256 of that token is stored in the DB. Logout / password
-    change / admin action can revoke sessions immediately.
-  * Registrations land as un-approved. An admin must approve via admin.py
-    before the user can sign in.
-  * Password resets are admin-issued: admin.py mints a single-use, 24 h token
-    and prints a /reset?token=... link to hand to the user out of band.
-  * Login attempts are throttled per (ip, email) in memory. Single-process
-    only - fine for a small Render/Fly deploy.
-
 The router is mounted by server.py. The require_user dependency is what gates
 the chat endpoint.
 """

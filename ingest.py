@@ -23,6 +23,13 @@ import pdfplumber
 
 RULE_START = re.compile(r"^(\d{3}\.\d+)\.?\s")          # base rule, e.g. "509.2."
 
+# Top-level sections in the Comprehensive Rules look like "1. Game Concepts",
+# "5. The Combat Phase", etc. Subsections look like "509. Declare Attackers
+# Step" (3 digits, no second number). These are what the docs page uses to
+# group rules in the TOC.
+SECTION_START    = re.compile(r"^([1-9])\.\s+([A-Z][^\d].*)$")
+SUBSECTION_START = re.compile(r"^(\d{3})\.\s+([A-Z][^\d].*)$")
+
 # A line that is *only* the word Glossary or Credits - the real section headings.
 STOP_SECTION = re.compile(r"^(glossary|credits)\s*$", re.IGNORECASE)
 
@@ -84,6 +91,57 @@ def chunk_rules(text: str):
     ]
 
 
+def extract_sections(text: str):
+    """Walk the PDF text once, pulling out the section + subsection titles
+    used as TOC labels on the docs page.
+
+    A line that matches both as a section *and* as a subsection (or appears
+    twice - once in the table of contents and again at its actual location)
+    is fine: we just overwrite with the same value. The TOC pass before any
+    rules also gets superseded by the in-body pass with the same text.
+
+    Returns two dicts:
+        sections    -> {"5": "The Combat Phase", ...}
+        subsections -> {"509": "Declare Attackers Step", ...}
+    """
+    sections, subsections = {}, {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if RULE_START.match(stripped):
+            continue  # skip rules - they look like "509.2. ..." not titles
+        m_sub = SUBSECTION_START.match(stripped)
+        if m_sub:
+            subsections[m_sub.group(1)] = m_sub.group(2).strip()
+            continue
+        m_sec = SECTION_START.match(stripped)
+        if m_sec:
+            sections[m_sec.group(1)] = m_sec.group(2).strip()
+    return sections, subsections
+
+
+def write_docs_json(text: str, rule_chunks: list, out_path: Path):
+    """Write a docs-friendly JSON: section + subsection titles plus the
+    per-rule chunks. The browser uses this to render the rules docs page
+    without needing the BM25-overlapping glossary chunks in index.json."""
+    sections, subsections = extract_sections(text)
+    docs = {
+        "sections": sections,
+        "subsections": subsections,
+        "rules": [
+            {"rule": c["rule"], "text": c["text"]}
+            for c in rule_chunks if c.get("rule")
+        ],
+    }
+    out_path.write_text(
+        json.dumps(docs, ensure_ascii=False, indent=0), encoding="utf-8"
+    )
+    print(
+        f"Wrote {out_path} "
+        f"({len(sections)} sections, {len(subsections)} subsections, "
+        f"{len(docs['rules'])} rules)."
+    )
+
+
 def chunk_fixed(text: str, size: int = 1100, overlap: int = 150):
     """
     Generic overlapping chunker for prose PDFs (or the glossary tail).
@@ -128,6 +186,7 @@ def main():
     print(f"Lines that look like a rule number: {rule_hits}")
 
     chunks = chunk_rules(text)
+    rule_chunks_only = list(chunks)  # snapshot before the glossary is appended
     if chunks:
         # Append the trailing Glossary as fixed-size chunks too. Use the LAST
         # "Glossary" line (the real heading), not the table-of-contents entry.
@@ -137,6 +196,7 @@ def main():
         print(f"Detected Comprehensive Rules: {len(chunks)} chunks.")
     else:
         chunks = chunk_fixed(text)
+        rule_chunks_only = []
         print(f"Prose / unstructured rulebook: {len(chunks)} fixed-size chunks.")
 
     out = Path(__file__).parent / "index.json"
@@ -146,6 +206,14 @@ def main():
         json.dumps(chunks, ensure_ascii=False, indent=0), encoding="utf-8"
     )
     print(f"Wrote {out} ({len(chunks)} chunks).")
+
+    # docs.json powers the in-app /pages/rules documentation page. It's only
+    # meaningful when the input looked like the Comprehensive Rules, so we
+    # skip it for the prose fallback case (no rule numbers => no TOC).
+    if rule_chunks_only:
+        write_docs_json(
+            text, rule_chunks_only, Path(__file__).parent / "docs.json"
+        )
 
 
 if __name__ == "__main__":
