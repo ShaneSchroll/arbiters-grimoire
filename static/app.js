@@ -19,19 +19,61 @@ function scrollChatToBottom(force) {
 
 // Verify the user is signed in before showing the chat. A missing or
 // expired cookie returns 401 here, which bounces back to the login page.
-(async () => {
+// Also renders today's spend under the email and hides the Opus option for
+// users who aren't allowed to use it (enforced server-side regardless).
+function applyMe(me) {
+    whoEl.textContent = me.email;
+    // Spend line, inserted once, directly after the email element.
+    let spendEl = document.getElementById("spend");
+    if (!spendEl) {
+        spendEl = document.createElement("span");
+        spendEl.id = "spend";
+        spendEl.title = "Your usage today (resets 00:00 UTC)";
+        whoEl.insertAdjacentElement("afterend", spendEl);
+    }
+    if (typeof me.spent_usd === "number") {
+        const spent = "$" + me.spent_usd.toFixed(2);
+        spendEl.textContent = me.unlimited
+            ? spent + " today"
+            : spent + " / $" + Number(me.budget_usd).toFixed(2) + " today";
+    } else {
+        spendEl.textContent = "";
+    }
+    // Opus visibility: drop the option entirely if not permitted, so it never
+    // appears selectable. Server still downgrades unauthorized requests.
+    if (modelEl) {
+        const opt = modelEl.querySelector('option[value="claude-opus-4-7"]');
+        if (opt && !me.can_use_opus) {
+            if (modelEl.value === opt.value) modelEl.value = "claude-sonnet-4-6";
+            opt.remove();
+        }
+    }
+    // Admins get a link to the management panel.
+    if (me.is_admin && accountMenu && !document.getElementById("admin-link")) {
+        const a = document.createElement("a");
+        a.id = "admin-link";
+        a.className = "rules-link";
+        a.href = "/admin";
+        a.textContent = "Admin";
+        accountMenu.insertBefore(a, accountMenu.firstChild);
+    }
+}
+
+async function refreshMe() {
     try {
         const res = await fetch("/api/auth/me");
         if (!res.ok) {
             window.location.href = "/login";
-            return;
+            return null;
         }
         const me = await res.json();
-        whoEl.textContent = me.email;
+        applyMe(me);
+        return me;
     } catch {
         window.location.href = "/login";
+        return null;
     }
-})();
+}
 
 logoutEl.addEventListener("click", async () => {
     try { await fetch("/api/auth/logout", { method: "POST" }); }
@@ -66,6 +108,10 @@ document.addEventListener("keydown", (e) => {
         accountToggle.focus();
     }
 });
+
+// Initial auth check + header population, now that all referenced elements
+// (account menu, model select) are defined above.
+refreshMe();
 
 // Chip preview length. Keeps chips skim-able; full text is in the modal.
 const CHIP_TEXT_MAX = 120;
@@ -438,6 +484,8 @@ async function send() {
         appendSources(thinking, sources);
         scrollChatToBottom();
         history.push({ role: "assistant", content: accumulated });
+        // Usage was just billed server-side; update the spend readout.
+        refreshMe();
     } catch (e) {
         thinking.innerHTML = "Error reaching the server. Is it running?";
     } finally {

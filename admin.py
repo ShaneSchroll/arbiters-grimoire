@@ -32,12 +32,22 @@ def cmd_list(_):
     if not users:
         print("(no users)")
         return
-    print(f"{'EMAIL':40} {'APPROVED':10} {'ADMIN':6} CREATED")
+    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'OPUS':5} {'BUDGET/DAY':12} CREATED")
     for u in users:
+        raw = u["daily_budget_micros"]
+        if raw is None:
+            budget = "default"
+        elif raw < 0:
+            budget = "unlimited"
+        else:
+            budget = f"${raw / 1_000_000:.2f}"
+        opus = "yes" if (u["is_admin"] or u["opus_allowed"]) else "no"
         print(
-            f"{u['email']:40} "
-            f"{'yes' if u['approved'] else 'no':10} "
+            f"{u['email']:36} "
+            f"{'yes' if u['approved'] else 'no':5} "
             f"{'yes' if u['is_admin'] else 'no':6} "
+            f"{opus:5} "
+            f"{budget:12} "
             f"{u['created_at']}"
         )
 
@@ -82,6 +92,15 @@ def cmd_make_admin(args):
         sys.exit(f"No such user: {args.email}")
 
 
+def cmd_opus(args):
+    allowed = args.on  # argparse guarantees exactly one of --on/--off
+    if auth.set_opus_allowed(args.email, allowed):
+        state = "enabled" if allowed else "disabled"
+        print(f"Opus access {state} for {args.email}")
+    else:
+        sys.exit(f"No such user: {args.email}")
+
+
 def cmd_reset(args):
     user = auth.get_user_by_email(args.email.lower())
     if not user:
@@ -102,6 +121,47 @@ def cmd_delete(args):
         print(f"Deleted {args.email}")
     else:
         sys.exit(f"No such user: {args.email}")
+
+
+def _fmt_usd(micros: int) -> str:
+    return f"${micros / 1_000_000:.4f}"
+
+
+def cmd_budget(args):
+    if args.unlimited:
+        micros = -1
+    elif args.default:
+        micros = None
+    elif args.usd is not None:
+        if args.usd < 0:
+            sys.exit("Use --unlimited for no cap; --usd must be >= 0.")
+        micros = int(round(args.usd * 1_000_000))
+    else:
+        sys.exit("Specify one of --usd N, --unlimited, or --default.")
+
+    if not auth.set_daily_budget(args.email, micros):
+        sys.exit(f"No such user: {args.email}")
+
+    if micros is None:
+        print(f"{args.email}: daily budget reset to default "
+              f"({_fmt_usd(auth.DEFAULT_DAILY_BUDGET_MICROS)}/day).")
+    elif micros < 0:
+        print(f"{args.email}: daily budget set to UNLIMITED.")
+    else:
+        print(f"{args.email}: daily budget set to {_fmt_usd(micros)}/day.")
+
+
+def cmd_usage(args):
+    s = auth.usage_summary_today(args.email)
+    if s is None:
+        sys.exit(f"No such user: {args.email}")
+    print(f"{s['email']} - usage today (resets 00:00 UTC):")
+    print(f"  spent:     {_fmt_usd(s['spent_micros'])}")
+    if s["unlimited"]:
+        print("  budget:    unlimited")
+    else:
+        print(f"  budget:    {_fmt_usd(s['budget_micros'])}")
+        print(f"  remaining: {_fmt_usd(s['remaining_micros'])}")
 
 
 def main():
@@ -135,6 +195,25 @@ def main():
     sp.add_argument("email")
     sp.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     sp.set_defaults(func=cmd_delete)
+
+    sp = sub.add_parser("budget", help="Set a user's daily spend cap")
+    sp.add_argument("email")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--usd", type=float, help="Daily cap in US dollars, e.g. 2.50")
+    g.add_argument("--unlimited", action="store_true", help="No daily cap")
+    g.add_argument("--default", action="store_true", help="Use the global default")
+    sp.set_defaults(func=cmd_budget)
+
+    sp = sub.add_parser("usage", help="Show a user's spend so far today")
+    sp.add_argument("email")
+    sp.set_defaults(func=cmd_usage)
+
+    sp = sub.add_parser("opus", help="Grant or revoke Opus model access")
+    sp.add_argument("email")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--on", action="store_true", help="Allow this user to use Opus")
+    g.add_argument("--off", action="store_true", help="Disallow Opus for this user")
+    sp.set_defaults(func=cmd_opus)
 
     args = p.parse_args()
     args.func(args)
