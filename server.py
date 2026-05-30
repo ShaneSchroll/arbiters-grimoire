@@ -583,3 +583,10 @@ def admin_page(request: Request):
     if not user["is_admin"]:
         # Approved non-admins get bounced to the app rather than the panel.
         return RedirectResponse("/", status_code=302)
+    if ADMIN_HTML is None:
+        raise HTTPException(
+            status_code=503,
+            detail="admin.html is not deployed. Place it alongside your other "
+                   "auth pages (login.html/register.html).",
+        )
+    return FileResponse(ADMIN_HTML)
