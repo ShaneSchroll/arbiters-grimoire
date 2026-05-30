@@ -32,9 +32,6 @@ async function init() {
     if (!res.ok) throw new Error("docs.json " + res.status);
     const docs = await res.json();
 
-    // Tree the rules by section ("5") and subsection ("509") for both the
-    // TOC and the body. Section/subsection keys come from docs.sections /
-    // docs.subsections; rules are sorted so 100.1 < 100.10 numerically.
     const tree = groupRules(docs);
 
     buildToc(tree, docs);
@@ -84,21 +81,13 @@ function groupRules(docs) {
     return tree;
 }
 
-/*  escaping + inline rendering (anchorized)  */
-
+/*  escaping + inline rendering */
 function escapeHtml(s) {
     return s.replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
 }
 
 // Same inline transforms as the chat bubble, but rule numbers become
 // clickable cross-references that scroll to the target rule.
-//
-// Important: we deliberately do NOT use `href="#rule-X"`. Rule IDs
-// contain a "." (e.g. "rule-114.1c"), which is a valid HTML id but
-// invalid as a CSS selector ("." starts a class). The browser would
-// happily put the bad hash in the URL but every `querySelector(hash)`
-// after that throws SyntaxError. And we don't need shareable URLs here -
-// the docs page is in-app navigation - so we just scroll on click.
 function renderInlineWithLinks(escaped) {
     let h = escaped;
     h = h.replace(/`([^`]+)`/g, "<code>$1</code>");

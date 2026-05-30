@@ -21,6 +21,8 @@ Behind a proxy (Render):
 import json
 import os
 import re
+import card_refresh
+import deckbuilder
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -95,6 +97,8 @@ ADMIN_HTML = _find_admin_html()
 ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-7"}
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
+deckbuilder.configure(client, ALLOWED_MODELS, DEFAULT_MODEL)
+
 # Static, cacheable persona. Kept separate from the per-question rules text so
 # it can be marked with cache_control and reused cheaply across requests.
 SYSTEM_PERSONA = """You are the MTG Rules Oracle, a meticulous judge-level \
@@ -118,12 +122,6 @@ async def lifespan(_: FastAPI):
     auth.init_db()
     yield
 
-
-# Content-Security-Policy is tailored to what the app actually loads: same-origin
-# assets, Google Fonts (stylesheet from googleapis, font files from gstatic), and
-# data: SVGs used in CSS. 'unsafe-inline' in script-src is required only by the
-# inline <script> blocks in the auth pages (login/register/reset); move those to
-# external files to drop it and get real script-injection protection.
 _CSP = (
     "default-src 'self'; "
     "img-src 'self' data:; "
@@ -167,15 +165,11 @@ class SecurityHeadersMiddleware:
 
 app = FastAPI(title="MTG Rules Oracle", lifespan=lifespan)
 app.add_middleware(SecurityHeadersMiddleware)
-# Gzip JSON / HTML over the wire. Big win for docs.json (~1MB → ~360KB),
-# negligible cost. minimum_size skips tiny payloads that wouldn't benefit.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(auth.router)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
-
-# Caps on chat input. Bound request cost so an approved (or compromised)
-# account can't drive unbounded Anthropic spend with huge payloads.
+# Caps on chat input
 MAX_MESSAGES = 15
 MAX_MESSAGE_CHARS = 8_000
 MAX_TOTAL_CHARS = 24_000
@@ -183,8 +177,6 @@ MAX_TOTAL_CHARS = 24_000
 
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
-    # No min_length: the client replays prior assistant turns verbatim and an
-    # empty turn must not 422 the whole request. max_length is the cost guard.
     content: str = Field(max_length=MAX_MESSAGE_CHARS)
 
 
@@ -229,7 +221,6 @@ def build_system(question: str):
 
 def filter_sources(answer: str, sources: list) -> list:
     """Keep only sources whose rule number was actually cited in the answer.
-
     Glossary chunks (rule is None, id like "chunk-0001") never match a
     citation directly, so they drop out — but Claude almost always cites the
     numbered rule the glossary entry points to, which IS in the retrieved set.
@@ -572,7 +563,25 @@ def admin_create(payload: dict = Body(...), _admin=Depends(_admin_guard), reques
     return {"ok": True, "reset_url": f"{base}/reset?token={quote(token)}"}
 
 
+@admin_router.post("/refresh-cards")
+def admin_refresh_cards(payload: dict = Body(default={}), _admin=Depends(_admin_guard)):
+    # _admin_guard = same-origin + admin, matching your other state-changing routes
+    return card_refresh.start_refresh(force=bool(payload.get("force", False)))
+
+@admin_router.get("/refresh-cards/status")
+def admin_refresh_cards_status(_admin=Depends(auth.require_admin)):
+    return card_refresh.get_status()
+
+
 app.include_router(admin_router)
+app.include_router(deckbuilder.router)
+
+@app.get("/deckbuilder")
+def deckbuilder_page(request: Request):
+    user = auth.get_current_user(request)
+    if not user or not user["approved"]:
+        return RedirectResponse("/login", status_code=302)
+    return FileResponse(PAGES_DIR / "deckbuilder.html")
 
 
 @app.get("/admin")
