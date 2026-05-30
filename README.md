@@ -42,6 +42,11 @@ python admin.py revoke  alice@example.com
 python admin.py make-admin alice@example.com
 python admin.py reset   alice@example.com [--base-url https://oracle.example.com]
 python admin.py delete  alice@example.com [--yes]
+
+python admin.py budget alice@example.com --usd 2.50    # custom daily cap
+python admin.py budget alice@example.com --unlimited   # no cap
+python admin.py budget alice@example.com --default     # back to global default
+python admin.py usage  alice@example.com               # today's spend + remaining
 ```
 
 Then open **http://localhost:8000**.

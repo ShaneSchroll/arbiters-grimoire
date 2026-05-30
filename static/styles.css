@@ -993,6 +993,20 @@ header select {
     white-space: nowrap;
 }
 
+/* Today's spend, shown next to the email. Monospace so the dollar figures
+   line up; muted and a touch smaller so it stays secondary to the email. */
+#spend {
+    display: inline-flex;
+    align-items: center;
+    height: 32px;
+    padding-left: 10px;
+    color: var(--muted-2);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
+}
+
 /**
   * Account menu
   * Desktop: the toggle button is hidden and the menu uses display:contents
