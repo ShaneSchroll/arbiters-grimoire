@@ -6,59 +6,9 @@
         <title>Deck Builder &middot; The Oracle</title>
         <link rel="icon" type="image/svg+xml" href="/static/dist/favicon.svg" />
         <link rel="stylesheet" href="/static/dist/styles-dist.css" />
+        <link rel="stylesheet" href="/static/dist/deckbuilder-dist.css" />
         <script src="/static/dist/app-dist.js" defer></script>
         <script src="/static/dist/deckbuilder-dist.js" defer></script>
-
-        <style>
-            #db { flex: 1; overflow-y: auto; padding: 26px 0; }
-            .db-grid { display: grid; gap: 18px; }
-            .db-field label {
-                display: block; font-size: 13px; color: var(--muted);
-                margin-bottom: 6px; letter-spacing: .2px;
-            }
-            #decklist {
-                width: 100%; min-height: 180px; resize: vertical;
-                background: var(--panel-2); color: var(--text);
-                border: 1px solid var(--line); border-radius: 9px;
-                padding: 12px 14px; font: 14px/1.6 var(--mono);
-            }
-            .db-row { display: flex; gap: 12px; flex-wrap: wrap; }
-            .db-row > .db-field { flex: 1; min-width: 200px; }
-            #notes {
-                width: 100%; background: var(--panel-2); color: var(--text);
-                border: 1px solid var(--line); border-radius: 9px;
-                padding: 10px 12px; font-size: 14px;
-            }
-            .db-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-            .db-build {
-                background: var(--accent); color: #1a1408; border: none;
-                border-radius: 9px; padding: 11px 20px; font-weight: 600;
-                font-size: 15px; cursor: pointer;
-            }
-            .db-build:disabled { opacity: .55; cursor: default; }
-            .db-hint { color: var(--muted-2); font-size: 12.5px; }
-
-            /* Conversation transcript reuses the chat bubble classes. */
-            #transcript { margin-top: 6px; display: flex; flex-direction: column; gap: 14px; }
-            #transcript:empty { display: none; }
-
-            /* Follow-up row: hidden until the first build produces a transcript. */
-            .db-followup { display: none; gap: 10px; margin-top: 6px; }
-            .db-followup.show { display: flex; }
-            #followup {
-                flex: 1; resize: none; min-height: 44px; max-height: 140px;
-                background: var(--panel-2); color: var(--text);
-                border: 1px solid var(--line); border-radius: 9px;
-                padding: 11px 14px; font-size: 14px;
-            }
-            .db-followup .send {
-                background: var(--panel-2); color: var(--text);
-                border: 1px solid var(--line); border-radius: 9px;
-                padding: 0 18px; font-weight: 600; cursor: pointer;
-            }
-            .db-followup .send:hover { border-color: var(--accent); }
-            .db-followup .send:disabled { opacity: .55; cursor: default; }
-        </style>
     </head>
 
     <body>
