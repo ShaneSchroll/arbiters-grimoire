@@ -33,12 +33,21 @@ import unicodedata
 from pathlib import Path
 
 import httpx
+import ijson  # streaming JSON parser — keeps memory flat on small instances
 
 SCRYFALL = "https://api.scryfall.com"
 BULK_TYPE = "oracle_cards"  # one row per gameplay-unique card
 USER_AGENT = "mtg-rules-assistant/1.0"
 ACCEPT = "application/json;q=0.9,*/*;q=0.8"  # Scryfall asks clients to send Accept
 DEFAULT_OUT = Path(__file__).resolve().parent / "cards.db"
+
+# Layouts with no rules text worth ruling on — skipped so they don't pollute
+# fuzzy matches.
+SKIP_LAYOUTS = {"token", "double_faced_token", "art_series",
+                "emblem", "vanguard", "scheme"}
+# Rows per INSERT. Small enough that the in-flight batch is a few MB; large
+# enough that we're not paying per-statement overhead 30k times.
+BATCH = 2000
 
 
 def normalize_name(name: str) -> str:
@@ -82,21 +91,36 @@ def project(card: dict) -> dict:
     }
 
 
-def fetch_bulk_download_uri(client: httpx.Client) -> tuple[str, str]:
-    """Resolve the current oracle_cards download URL + its updated_at stamp.
+def fetch_bulk_download_uri(client: httpx.Client) -> tuple[str, str, int]:
+    """Resolve the current oracle_cards download URL, its updated_at stamp, and
+    the file size in bytes.
 
     The download URL's filename changes daily, so we always ask the API for the
-    latest one rather than hardcoding it. This is a single lightweight request."""
+    latest one rather than hardcoding it. This is a single lightweight request.
+    `size` is the uncompressed byte size of the file, which is what we write to
+    disk — so it's an accurate denominator for download progress."""
     r = client.get(f"{SCRYFALL}/bulk-data/{BULK_TYPE}", timeout=30)
     r.raise_for_status()
     meta = r.json()
-    return meta["download_uri"], meta.get("updated_at", "")
+    return meta["download_uri"], meta.get("updated_at", ""), int(meta.get("size", 0))
 
 
-def build(out: Path, force: bool = False) -> None:
+ProgressFn = "Callable[[str, int, int], None] | None"
+
+
+def build(out: Path, force: bool = False, progress=None) -> None:
+    """Build cards.db. `progress`, if given, is called as
+    progress(phase, done, total) with byte counts during the two long phases:
+    phase is "downloading" then "parsing". It's a plain callback — the caller
+    decides how (and how often) to surface it; callers should throttle. None
+    keeps the CLI path side-effect-free."""
+    def emit(phase, done, total):
+        if progress is not None:
+            progress(phase, done, total)
+
     headers = {"User-Agent": USER_AGENT, "Accept": ACCEPT}
     with httpx.Client(headers=headers, follow_redirects=True) as client:
-        download_uri, updated_at = fetch_bulk_download_uri(client)
+        download_uri, updated_at, size = fetch_bulk_download_uri(client)
         print(f"[build] latest {BULK_TYPE} updated_at={updated_at or 'unknown'}")
 
         # Skip work if our db already reflects this bulk version.
@@ -109,48 +133,93 @@ def build(out: Path, force: bool = False) -> None:
         # The file is large (>150MB raw). Stream it straight to disk instead of
         # holding it all in memory, then parse from the temp file.
         tmp = out.with_suffix(".download.json")
+        got = 0
+        emit("downloading", 0, size)
         with client.stream("GET", download_uri, timeout=None) as resp:
             resp.raise_for_status()
+            # Prefer the metadata size; fall back to Content-Length if present.
+            total = size or int(resp.headers.get("content-length", 0))
             with open(tmp, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=1 << 20):
                     f.write(chunk)
+                    got += len(chunk)
+                    emit("downloading", got, total)  # ~150 calls; cheap
+        emit("downloading", got, total or got)
 
-    print("[build] parsing + writing SQLite…")
-    cards = json.loads(tmp.read_text(encoding="utf-8"))
-    _write_db(out, cards, updated_at)
-    tmp.unlink(missing_ok=True)
-    print(f"[build] wrote {out} with {len(cards)} cards.")
+    print("[build] parsing + writing SQLite (streaming)…")
+    # Parse the bulk file straight off disk, one card at a time, so memory stays
+    # flat regardless of file size. The previous json.loads(read_text(...)) held
+    # the whole ~150MB file as a string AND the full ~30k-object graph at once,
+    # which blows past a 512MB instance and gets the process OOM-killed (SIGKILL,
+    # so card_refresh's except-handler never even sees it).
+    try:
+        count = _write_db(out, tmp, updated_at, progress=emit)
+    finally:
+        tmp.unlink(missing_ok=True)  # always clear the ~150MB download temp
+    print(f"[build] wrote {out} with {count} cards.")
 
 
-def _write_db(out: Path, cards: list[dict], updated_at: str) -> None:
-    # Build into a temp db then atomically swap, so a running server never
-    # reads a half-written file.
+def _write_db(out: Path, src: Path, updated_at: str, progress=None) -> int:
+    """Stream-parse the bulk JSON array at `src` and write cards.db.
+
+    Builds into a temp db then atomically swaps, so a running server never reads
+    a half-written file. Returns the number of cards written. `progress`, if
+    given, is called as progress("parsing", bytes_consumed, file_size)."""
     tmp_db = out.with_suffix(".building.db")
     tmp_db.unlink(missing_ok=True)
+
+    file_size = src.stat().st_size or 1  # avoid divide-by-zero downstream
+
     con = sqlite3.connect(tmp_db)
+    written = 0
     try:
+        # journal_mode=OFF + synchronous=OFF: this is a throwaway temp db rebuilt
+        # from scratch on any failure, so we don't need crash durability here —
+        # and it avoids leaving -wal/-shm siblings next to the final file.
         con.executescript(
             """
-            PRAGMA journal_mode = WAL;
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
             CREATE TABLE cards (
                 norm   TEXT NOT NULL,   -- normalized name (lookup key)
                 name   TEXT NOT NULL,   -- canonical display name
                 data   TEXT NOT NULL    -- JSON: the projected gameplay fields
             );
-            CREATE INDEX idx_cards_norm ON cards(norm);
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             """
         )
-        rows = []
-        for c in cards:
-            # Skip non-gameplay layouts (tokens, art cards, etc.) — they have no
-            # rules text worth ruling on and only pollute fuzzy matches.
-            if c.get("layout") in {"token", "double_faced_token", "art_series",
-                                    "emblem", "vanguard", "scheme"}:
-                continue
-            name = c.get("name", "")
-            rows.append((normalize_name(name), name, json.dumps(project(c), ensure_ascii=False)))
-        con.executemany("INSERT INTO cards (norm, name, data) VALUES (?, ?, ?)", rows)
+
+        def batches():
+            batch = []
+            with open(src, "rb") as f:
+                # 'item' yields each element of the top-level JSON array in turn.
+                for c in ijson.items(f, "item"):
+                    if c.get("layout") in SKIP_LAYOUTS:
+                        continue
+                    name = c.get("name", "")
+                    batch.append((normalize_name(name), name,
+                                  json.dumps(project(c), ensure_ascii=False)))
+                    if len(batch) >= BATCH:
+                        # f.tell() is the byte offset ijson has consumed from the
+                        # file — a free, monotonic proxy for parse progress.
+                        if progress is not None:
+                            progress("parsing", f.tell(), file_size)
+                        yield batch
+                        batch = []
+            if batch:
+                yield batch
+
+        for batch in batches():
+            con.executemany(
+                "INSERT INTO cards (norm, name, data) VALUES (?, ?, ?)", batch)
+            written += len(batch)
+
+        if progress is not None:
+            progress("parsing", file_size, file_size)  # 100%
+
+        # Build the index AFTER the bulk load — far cheaper than maintaining it
+        # row-by-row during insert.
+        con.execute("CREATE INDEX idx_cards_norm ON cards(norm)")
         con.execute("INSERT INTO meta (key, value) VALUES ('updated_at', ?)", (updated_at,))
         con.execute("INSERT INTO meta (key, value) VALUES ('built_at', ?)",
                     (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),))
@@ -158,6 +227,7 @@ def _write_db(out: Path, cards: list[dict], updated_at: str) -> None:
     finally:
         con.close()
     tmp_db.replace(out)  # atomic on the same filesystem
+    return written
 
 
 def _db_stamp(db: Path) -> str:

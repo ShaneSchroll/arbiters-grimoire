@@ -19,6 +19,11 @@
             <button id="refresh" type="button">Refresh Panel</button>
         </header>
 
+        <div id="cards-progress">
+            <div class="pbar"><div class="pfill" id="cards-pfill"></div></div>
+            <div class="plabel" id="cards-plabel"></div>
+        </div>
+
         <div class="msg" id="msg"></div>
 
         <div class="toolbar">
@@ -45,7 +50,6 @@
             </table>
         </div>
 
-        <!-- New-user dialog -->
         <dialog id="create-dialog">
             <h3>Create user</h3>
             <div class="field">
@@ -278,6 +282,9 @@
 
             const cardsBtn = document.getElementById("refresh-cards");
             const cardsStatusEl = document.getElementById("cards-status");
+            const cardsProgEl = document.getElementById("cards-progress");
+            const cardsFillEl = document.getElementById("cards-pfill");
+            const cardsLabelEl = document.getElementById("cards-plabel");
             let cardsPoll = null;
 
             function renderCardsStatus(s) {
@@ -285,8 +292,23 @@
                 if (s.state === "running") {
                     cardsStatusEl.textContent = "Cards: updating…";
                     cardsBtn.disabled = true;
+
+                    // Progress bar: percent if we have one, else an indeterminate
+                    // sweep (e.g. while contacting Scryfall before bytes flow).
+                    cardsProgEl.classList.add("show");
+                    if (typeof s.percent === "number") {
+                        cardsProgEl.classList.remove("indeterminate");
+                        cardsFillEl.style.width = s.percent + "%";
+                    } else {
+                        cardsProgEl.classList.add("indeterminate");
+                        cardsFillEl.style.width = "";
+                    }
+                    cardsLabelEl.textContent = s.detail || s.message || "Working…";
                 } else {
                     cardsBtn.disabled = false;
+                    cardsProgEl.classList.remove("show", "indeterminate");
+                    cardsFillEl.style.width = "0%";
+                    cardsLabelEl.textContent = "";
                     cardsStatusEl.textContent = s.count
                         ? `Cards: ${s.count} · ${(s.updated_at || "").slice(0, 10)}`
                         : "";
@@ -295,12 +317,16 @@
                 }
             }
 
+            // Poll faster while a build is running so the bar moves smoothly; a
+            // single admin hitting a tiny JSON endpoint ~once a second is trivial.
+            const POLL_MS = 1000;
+
             async function pollCards() {
                 try {
                     const s = await api("/api/admin/refresh-cards/status");
                     renderCardsStatus(s);
                     if (s && s.state === "running" && !cardsPoll) {
-                        cardsPoll = setInterval(pollCards, 2000);
+                        cardsPoll = setInterval(pollCards, POLL_MS);
                     } else if (s && s.state !== "running" && cardsPoll) {
                         clearInterval(cardsPoll); cardsPoll = null;
                     }
@@ -310,7 +336,7 @@
             cardsBtn.onclick = async () => {
                 try {
                     renderCardsStatus(await api("/api/admin/refresh-cards", {}));
-                    if (!cardsPoll) cardsPoll = setInterval(pollCards, 2000);
+                    if (!cardsPoll) cardsPoll = setInterval(pollCards, POLL_MS);
                 } catch (e) { showMsg(e.message, "error"); }
             };
 
