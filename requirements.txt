@@ -1,7 +1,6 @@
 anthropic==0.105.2
 fastapi==0.136.3
 uvicorn[standard]==0.48.0
-pdfplumber==0.11.9
 rank-bm25==0.2.2
 python-dotenv==1.2.2
 httpx==0.28.1

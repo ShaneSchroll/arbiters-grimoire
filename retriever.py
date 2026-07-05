@@ -22,11 +22,11 @@ def tokenize(text: str):
 
 
 class Retriever:
-    def __init__(self, index_path: str = None):
-        path = Path(index_path or Path(__file__).parent / "index.json")
+    def __init__(self, rules_path: str = None):
+        path = Path(rules_path or Path(__file__).parent / "rules.json")
         if not path.exists():
             raise FileNotFoundError(
-                "index.json not found. Run `python ingest.py <your.pdf>` first."
+                "rules.json not found. Run `python ingest.py rules.txt` first."
             )
         # encoding="utf-8" matches how ingest.py writes the file
         self.chunks = json.loads(path.read_text(encoding="utf-8"))

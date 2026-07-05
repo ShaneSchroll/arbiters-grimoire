@@ -1,17 +1,24 @@
 """
-ingest.py - One-time preprocessing of your MTG rulebook PDF.
+ingest.py - Preprocess the official MTG Comprehensive Rules into search JSON.
 
-Run this once (or when the rules change - official magic rules pdf used):
+Wizards publishes the Comprehensive Rules as a plain-text file: one rule or
+subrule per line, blank-line separated. Parsing that is far more reliable than
+scraping the old PDF - there are no page headers/footers, no mid-sentence line
+wraps, and rule/section boundaries are unambiguous. Grab the .txt from
+https://magic.wizards.com/en/rules.
 
-    python ingest.py path/to/MagicCompRules.pdf
+Run once, and again whenever the rules update:
 
-It extracts the text, splits it into retrievable chunks, and writes
-`index.json` next to this script. The server reads that file at startup.
+    python ingest.py rules.txt
 
-The chunker is tuned for the official Magic Comprehensive Rules (rules are
-numbered like "509.2" with lettered subrules like "509.2a"). If your PDF is a
-prose-style rulebook instead, it automatically falls back to fixed-size
-overlapping chunks, so it works either way.
+It writes two files next to this script:
+  - rules.json : one chunk per base rule (its subrules and examples folded in),
+                 plus one chunk per glossary term. retriever.py BM25-searches it.
+  - docs.json  : section/subsection titles + per-rule text, for the in-app
+                 rules page (/pages/rules).
+
+UTF-8 throughout: the rules contain characters like the real minus sign
+(U+2212) and curly quotes that Windows' default cp1252 codec can't write.
 """
 
 import json
@@ -19,213 +26,181 @@ import re
 import sys
 from pathlib import Path
 
-import pdfplumber
-
-RULE_START = re.compile(r"^(\d{3}\.\d+)\.?\s")          # base rule, e.g. "509.2."
-
-# Top-level sections in the Comprehensive Rules look like "1. Game Concepts",
-# "5. The Combat Phase", etc. Subsections look like "509. Declare Attackers
-# Step" (3 digits, no second number). These are what the docs page uses to
-# group rules in the TOC.
-SECTION_START    = re.compile(r"^([1-9])\.\s+([A-Z][^\d].*)$")
-SUBSECTION_START = re.compile(r"^(\d{3})\.\s+([A-Z][^\d].*)$")
-
-# A line that is *only* the word Glossary or Credits - the real section headings.
-STOP_SECTION = re.compile(r"^(glossary|credits)\s*$", re.IGNORECASE)
+# "1. Game Concepts" - one of the nine top-level sections.
+SECTION = re.compile(r"^([1-9])\.\s+(\S.*)$")
+# "100. General" - a three-digit subsection heading (no rule number follows).
+SUBSECTION = re.compile(r"^(\d{3})\.\s+(\S.*)$")
+# "100.1. ..." - a base rule. The period is optional to tolerate the occasional
+# source typo (e.g. "606.5 ..."). Subrules ("100.1a ...") and "Example:" lines
+# intentionally do NOT match: they fold into the base rule's chunk.
+BASE_RULE = re.compile(r"^(\d{3}\.\d+)\.?\s")
+# "These rules are effective as of June 19, 2026." - the CR's version stamp,
+# in the preamble above the first rule. Captures the date string.
+EFFECTIVE_DATE = re.compile(r"effective as of\s+(.+?)\.?\s*$", re.IGNORECASE)
 
 
-def extract_text(pdf_path: str) -> str:
-    """Pull raw text out of every page of the PDF."""
-    pages = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            pages.append(page.extract_text() or "")
-            print(f"  extracted page {i + 1}/{len(pdf.pages)}", end="\r")
-    print()
-    return "\n".join(pages)
-
-
-def chunk_rules(text: str):
-    """
-    Split Comprehensive-Rules text into one chunk per base rule (subrules
-    included), so an entire rule and its clarifications stay together.
-
-    Returns a list of {"id", "rule", "text"} dicts, or [] if the text does
-    not look like the Comprehensive Rules.
-    """
-    lines = text.splitlines()
-    chunks = []
-    current = None  # {"rule": str, "lines": [str]}
-    seen = 0        # how many rules we've started - guards against TOC noise
-
-    for line in lines:
-        stripped = line.strip()
-        m = RULE_START.match(stripped)
+def find_effective_date(preamble: list[str]) -> str | None:
+    """The date string from the CR's 'These rules are effective as of ...' line,
+    or None if it's absent (e.g. a source file trimmed above the Introduction).
+    Only the preamble (before the first rule) is scanned so a rule that happens
+    to contain the phrase can't be mistaken for the version stamp."""
+    for ln in preamble:
+        m = EFFECTIVE_DATE.search(ln.strip())
         if m:
-            seen += 1
-            if current:
-                chunks.append(current)
-            current = {"rule": m.group(1), "lines": [stripped]}
-        elif current is not None:
-            # The real Glossary/Credits sections come AFTER all the numbered
-            # rules. Stop here so they don't bloat the final rule's chunk.
-            # The `seen > 50` guard ignores the identical words that appear
-            # in the table of contents before any rules have started.
-            if STOP_SECTION.match(stripped) and seen > 50:
-                break
-            current["lines"].append(stripped)
-
-    if current:
-        chunks.append(current)
-
-    if len(chunks) < 20:
-        return []  # not the Comprehensive Rules - caller should fall back
-
-    return [
-        {
-            "id": f"rule-{c['rule']}",
-            "rule": c["rule"],
-            "text": "\n".join(l for l in c["lines"] if l).strip(),
-        }
-        for c in chunks
-    ]
+            return m.group(1).strip()
+    return None
 
 
-def extract_sections(text: str):
-    """Walk the PDF text once, pulling out the section + subsection titles
-    used as TOC labels on the docs page.
+def split_body_and_glossary(lines: list[str]) -> tuple[int, int]:
+    """Find where the rules body and the glossary begin.
 
-    Stops at the real Glossary heading. The Glossary contains terms with
-    numbered definitions (e.g. "Vanguard\\n1. A casual variant..."). Without
-    the stop, those "1." / "2." / "3." lines match SECTION_START and
-    clobber the real "Game Concepts" / "Parts of a Card" / "Card Types"
-    titles. Sections 4-9 survive only because no glossary entry happens to
-    have that many numbered definitions. The `seen_rules > 50` guard
-    mirrors chunk_rules() and ignores the word "Glossary" that appears in
-    the table of contents before any rules have started.
-
-    A line that matches both as a section *and* as a subsection (or appears
-    twice - once in the table of contents and again at its actual location)
-    is fine: we just overwrite with the same value.
-
-    Returns two dicts:
-        sections    -> {"5": "The Combat Phase", ...}
-        subsections -> {"509": "Declare Attackers Step", ...}
+    The file opens with an Introduction and a CONTENTS table that repeats every
+    section/subsection title (plus the words "Glossary" and "Credits"). We skip
+    all of it by anchoring on the first real rule line, then stepping back over
+    the headings that introduce it so the first section/subsection titles still
+    get captured. The glossary is the last line that is exactly "Glossary".
     """
-    sections, subsections = {}, {}
-    seen_rules = 0
-    for line in text.splitlines():
-        stripped = line.strip()
-        if STOP_SECTION.match(stripped) and seen_rules > 50:
-            break
-        if RULE_START.match(stripped):
-            seen_rules += 1
-            continue  # skip rules - they look like "509.2. ..." not titles
-        m_sub = SUBSECTION_START.match(stripped)
-        if m_sub:
-            subsections[m_sub.group(1)] = m_sub.group(2).strip()
+    first_rule = next(
+        (i for i, ln in enumerate(lines) if BASE_RULE.match(ln.strip())), None
+    )
+    if first_rule is None:
+        raise ValueError(
+            "No rule lines found - is this the Comprehensive Rules .txt?"
+        )
+
+    body_start = first_rule
+    j = first_rule - 1
+    while j >= 0:
+        s = lines[j].strip()
+        if SECTION.match(s) or SUBSECTION.match(s):
+            body_start = j
+        elif s:
+            break  # a non-heading, non-blank line: the CONTENTS tail
+        j -= 1
+
+    glossary_start = max(
+        (i for i, ln in enumerate(lines) if ln.strip() == "Glossary"),
+        default=len(lines),
+    )
+    return body_start, glossary_start
+
+
+def parse_rules(body: list[str]):
+    """Walk the rules body once, returning (chunks, sections, subsections).
+
+    One chunk per base rule, with its subrules and examples folded in. Section
+    and subsection headings become titles - never text appended to the previous
+    rule. (Appending them was the PDF bug that left a rule chunk ending with the
+    next rule's heading.)
+    """
+    chunks: list[dict] = []
+    sections: dict[str, str] = {}
+    subsections: dict[str, str] = {}
+    current: dict | None = None
+
+    def flush():
+        nonlocal current
+        if current:
+            chunks.append({
+                "id": f"rule-{current['rule']}",
+                "rule": current["rule"],
+                "text": "\n".join(current["lines"]).strip(),
+            })
+        current = None
+
+    for raw in body:
+        line = raw.strip()
+        if not line:
             continue
-        m_sec = SECTION_START.match(stripped)
-        if m_sec:
+        m_rule = BASE_RULE.match(line)
+        if m_rule:
+            flush()
+            current = {"rule": m_rule.group(1), "lines": [line]}
+        elif m_sec := SECTION.match(line):
+            flush()
             sections[m_sec.group(1)] = m_sec.group(2).strip()
-    return sections, subsections
+        elif m_sub := SUBSECTION.match(line):
+            flush()
+            subsections[m_sub.group(1)] = m_sub.group(2).strip()
+        elif current is not None:
+            current["lines"].append(line)  # subrule, example, or continuation
+
+    flush()
+    return chunks, sections, subsections
 
 
-def write_docs_json(text: str, rule_chunks: list, out_path: Path):
-    """Write a docs-friendly JSON: section + subsection titles plus the
-    per-rule chunks. The browser uses this to render the rules docs page
-    without needing the BM25-overlapping glossary chunks in index.json."""
-    sections, subsections = extract_sections(text)
-    docs = {
-        "sections": sections,
-        "subsections": subsections,
-        "rules": [
-            {"rule": c["rule"], "text": c["text"]}
-            for c in rule_chunks if c.get("rule")
-        ],
-    }
-    out_path.write_text(
-        json.dumps(docs, ensure_ascii=False, indent=0), encoding="utf-8"
-    )
-    print(
-        f"Wrote {out_path} "
-        f"({len(sections)} sections, {len(subsections)} subsections, "
-        f"{len(docs['rules'])} rules)."
-    )
+def parse_glossary(gloss: list[str]):
+    """One chunk per glossary term: the term line plus its definition line(s),
+    blank-line separated. Per-term chunks retrieve far better than fixed-size
+    blobs for "what does <keyword> mean" questions."""
+    chunks: list[dict] = []
+    block: list[str] = []
 
-
-def chunk_fixed(text: str, size: int = 1100, overlap: int = 150):
-    """
-    Generic overlapping chunker for prose PDFs (or the glossary tail).
-
-    Splits on blank lines when the PDF has them; otherwise falls back to
-    splitting on single newlines, so it never produces one giant chunk.
-    """
-    units = [u.strip() for u in re.split(r"\n\s*\n", text) if u.strip()]
-    if len(units) < 5:  # PDF had no blank lines between paragraphs
-        units = [u.strip() for u in text.splitlines() if u.strip()]
-
-    chunks, buf = [], ""
-    for unit in units:
-        if len(buf) + len(unit) + 1 > size and buf:
-            chunks.append(buf.strip())
-            buf = buf[-overlap:] + " " + unit
-        else:
-            buf = (buf + "\n" + unit) if buf else unit
-    if buf.strip():
-        chunks.append(buf.strip())
-
-    return [
-        {"id": f"chunk-{i:04d}", "rule": None, "text": c}
-        for i, c in enumerate(chunks)
-    ]
+    for raw in [*gloss, ""]:  # trailing "" flushes the final block
+        line = raw.strip()
+        if line:
+            block.append(line)
+            continue
+        if block:
+            slug = re.sub(r"[^a-z0-9]+", "-", block[0].lower()).strip("-")
+            chunks.append({
+                "id": f"glossary-{slug or len(chunks)}",
+                "rule": None,
+                "text": "\n".join(block),
+            })
+            block = []
+    return chunks
 
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python ingest.py path/to/rulebook.pdf")
+        print("Usage: python ingest.py rules.txt")
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
-    if not Path(pdf_path).exists():
-        print(f"File not found: {pdf_path}")
+    src = Path(sys.argv[1])
+    if not src.exists():
+        print(f"File not found: {src}")
         sys.exit(1)
 
-    print(f"Reading {pdf_path} ...")
-    text = extract_text(pdf_path)
+    print(f"Reading {src} ...")
+    lines = src.read_text(encoding="utf-8").splitlines()
 
-    rule_hits = sum(1 for ln in text.splitlines() if RULE_START.match(ln.strip()))
-    print(f"Lines that look like a rule number: {rule_hits}")
+    body_start, glossary_start = split_body_and_glossary(lines)
+    effective_date = find_effective_date(lines[:body_start])
+    rules, sections, subsections = parse_rules(lines[body_start:glossary_start])
+    glossary = parse_glossary(lines[glossary_start + 1:])
 
-    chunks = chunk_rules(text)
-    rule_chunks_only = list(chunks)  # snapshot before the glossary is appended
-    if chunks:
-        # Append the trailing Glossary as fixed-size chunks too. Use the LAST
-        # "Glossary" line (the real heading), not the table-of-contents entry.
-        gloss = list(re.finditer(r"(?mi)^\s*glossary\s*$", text))
-        if gloss:
-            chunks += chunk_fixed(text[gloss[-1].start():])
-        print(f"Detected Comprehensive Rules: {len(chunks)} chunks.")
-    else:
-        chunks = chunk_fixed(text)
-        rule_chunks_only = []
-        print(f"Prose / unstructured rulebook: {len(chunks)} fixed-size chunks.")
+    here = Path(__file__).parent
 
-    out = Path(__file__).parent / "index.json"
-    # encoding="utf-8" is required: the CR contains characters like the real
-    # minus sign (U+2212) that Windows' default cp1252 codec cannot write.
-    out.write_text(
-        json.dumps(chunks, ensure_ascii=False, indent=0), encoding="utf-8"
+    rules_out = here / "rules.json"
+    rules_out.write_text(
+        json.dumps(rules + glossary, ensure_ascii=False, indent=0),
+        encoding="utf-8",
     )
-    print(f"Wrote {out} ({len(chunks)} chunks).")
+    print(
+        f"Wrote {rules_out} "
+        f"({len(rules)} rules + {len(glossary)} glossary entries)."
+    )
 
-    # docs.json powers the in-app /pages/rules documentation page. It's only
-    # meaningful when the input looked like the Comprehensive Rules, so we
-    # skip it for the prose fallback case (no rule numbers => no TOC).
-    if rule_chunks_only:
-        write_docs_json(
-            text, rule_chunks_only, Path(__file__).parent / "docs.json"
-        )
+    docs_out = here / "docs.json"
+    docs_out.write_text(
+        json.dumps(
+            {
+                "effective_date": effective_date,
+                "sections": sections,
+                "subsections": subsections,
+                "rules": [{"rule": c["rule"], "text": c["text"]} for c in rules],
+            },
+            ensure_ascii=False,
+            indent=0,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"Wrote {docs_out} "
+        f"({len(sections)} sections, {len(subsections)} subsections, "
+        f"{len(rules)} rules; effective date: {effective_date or 'not found'})."
+    )
 
 
 if __name__ == "__main__":

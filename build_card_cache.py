@@ -4,7 +4,7 @@ build a local SQLite card cache for instant, offline lookups.
 
 This is the cards-side analogue of ingest.py: a one-shot build step that
 produces an artifact (cards.db) the running server loads read-only via
-card_cache.CardCache — exactly how Retriever loads index.json.
+card_cache.CardCache — exactly how Retriever loads rules.json.
 
 Why bulk data instead of looping the API:
   Scryfall explicitly asks you NOT to fetch cards one-by-one for catalog-scale
@@ -17,7 +17,7 @@ Usage:
     python build_card_cache.py --out cards.db  # custom path
     python build_card_cache.py --force         # rebuild even if fresh
 
-Run it in your deploy/build step (next to `python ingest.py <pdf>`), or behind
+Run it in your deploy/build step (next to `python ingest.py rules.txt`), or behind
 the admin panel / a cron job. No new dependencies: httpx is already in your
 requirements, sqlite3 ships with Python.
 """
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -39,7 +40,10 @@ SCRYFALL = "https://api.scryfall.com"
 BULK_TYPE = "oracle_cards"  # one row per gameplay-unique card
 USER_AGENT = "mtg-rules-assistant/1.0"
 ACCEPT = "application/json;q=0.9,*/*;q=0.8"  # Scryfall asks clients to send Accept
-DEFAULT_OUT = Path(__file__).resolve().parent / "cards.db"
+# cards.db location. Configurable like AUTH_DB_PATH so it can live on a
+# persistent disk (e.g. CARD_DB_PATH=/var/data/cards.db) rather than the
+# ephemeral code directory; defaults next to this script for local dev.
+DEFAULT_OUT = Path(os.getenv("CARD_DB_PATH") or Path(__file__).resolve().parent / "cards.db")
 
 # Layouts with no rules text worth ruling on — skipped so they don't pollute
 # fuzzy matches.
@@ -159,63 +163,78 @@ def build(out: Path, force: bool = False, progress=None) -> None:
     print(f"[build] wrote {out} with {count} cards.")
 
 
-def _write_db(out: Path, src: Path, updated_at: str, progress=None) -> int:
-    """Stream-parse the bulk JSON array at `src` and write cards.db.
+# Throwaway temp-db pragmas + schema. journal_mode=OFF + synchronous=OFF: this
+# db is rebuilt from scratch on any failure, so we don't need crash durability
+# here — and it avoids leaving -wal/-shm siblings next to the final file.
+_SCHEMA = """
+    PRAGMA journal_mode = OFF;
+    PRAGMA synchronous = OFF;
+    CREATE TABLE cards (
+        norm   TEXT NOT NULL,   -- normalized name (lookup key)
+        name   TEXT NOT NULL,   -- canonical display name
+        data   TEXT NOT NULL    -- JSON: the projected gameplay fields
+    );
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def write_db(out: Path, records, updated_at: str, *,
+             progress=None, tell=None, total: int = 0) -> int:
+    """Write cards.db from an iterable of raw Scryfall card dicts.
+
+    The single writer shared by the live bulk download (see build/_write_db) and
+    the local-file ingest (card_ingest.py), so a cache built either way is
+    byte-for-byte identical. Filters non-gameplay layouts, projects each card to
+    the gameplay fields, and dedups gameplay-identical printings by oracle_id so
+    the cache holds one row per gameplay-unique card (the same shape Scryfall's
+    oracle_cards bulk already has, and what default/all_cards collapse to).
 
     Builds into a temp db then atomically swaps, so a running server never reads
-    a half-written file. Returns the number of cards written. `progress`, if
-    given, is called as progress("parsing", bytes_consumed, file_size)."""
+    a half-written file. `progress`, if given with `tell` (a callable returning
+    bytes consumed) and `total`, is called as progress("parsing", done, total).
+    Returns the number of rows written."""
     tmp_db = out.with_suffix(".building.db")
     tmp_db.unlink(missing_ok=True)
 
-    file_size = src.stat().st_size or 1  # avoid divide-by-zero downstream
-
     con = sqlite3.connect(tmp_db)
     written = 0
-    try:
-        # journal_mode=OFF + synchronous=OFF: this is a throwaway temp db rebuilt
-        # from scratch on any failure, so we don't need crash durability here —
-        # and it avoids leaving -wal/-shm siblings next to the final file.
-        con.executescript(
-            """
-            PRAGMA journal_mode = OFF;
-            PRAGMA synchronous = OFF;
-            CREATE TABLE cards (
-                norm   TEXT NOT NULL,   -- normalized name (lookup key)
-                name   TEXT NOT NULL,   -- canonical display name
-                data   TEXT NOT NULL    -- JSON: the projected gameplay fields
-            );
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-            """
-        )
+    seen: set[str] = set()  # oracle_id (or name) of cards already written
+    batch: list[tuple] = []
 
-        def batches():
-            batch = []
-            with open(src, "rb") as f:
-                # 'item' yields each element of the top-level JSON array in turn.
-                for c in ijson.items(f, "item"):
-                    if c.get("layout") in SKIP_LAYOUTS:
-                        continue
-                    name = c.get("name", "")
-                    batch.append((normalize_name(name), name,
-                                  json.dumps(project(c), ensure_ascii=False)))
-                    if len(batch) >= BATCH:
-                        # f.tell() is the byte offset ijson has consumed from the
-                        # file — a free, monotonic proxy for parse progress.
-                        if progress is not None:
-                            progress("parsing", f.tell(), file_size)
-                        yield batch
-                        batch = []
-            if batch:
-                yield batch
-
-        for batch in batches():
+    def flush():
+        nonlocal written
+        if batch:
             con.executemany(
                 "INSERT INTO cards (norm, name, data) VALUES (?, ?, ?)", batch)
             written += len(batch)
+            batch.clear()
 
-        if progress is not None:
-            progress("parsing", file_size, file_size)  # 100%
+    try:
+        con.executescript(_SCHEMA)
+
+        for card in records:
+            if card.get("layout") in SKIP_LAYOUTS:
+                continue
+            name = card.get("name", "")
+            # oracle_id is stable across every printing of a gameplay-unique
+            # card; fall back to the normalized name for the rare card without
+            # one. Skipping seen keys collapses default/all_cards printings.
+            key = card.get("oracle_id") or normalize_name(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            batch.append((normalize_name(name), name,
+                          json.dumps(project(card), ensure_ascii=False)))
+            if len(batch) >= BATCH:
+                if progress is not None and tell is not None and total:
+                    # A free, monotonic proxy for parse progress.
+                    progress("parsing", tell(), total)
+                flush()
+        flush()
+
+        if progress is not None and total:
+            progress("parsing", total, total)  # 100%
 
         # Build the index AFTER the bulk load — far cheaper than maintaining it
         # row-by-row during insert.
@@ -228,6 +247,17 @@ def _write_db(out: Path, src: Path, updated_at: str, progress=None) -> int:
         con.close()
     tmp_db.replace(out)  # atomic on the same filesystem
     return written
+
+
+def _write_db(out: Path, src: Path, updated_at: str, progress=None) -> int:
+    """Live-download path: stream-parse the bulk JSON array at `src` into the
+    shared writer. 'item' yields each element of the top-level array in turn;
+    f.tell() is the byte offset ijson has consumed — a monotonic progress proxy."""
+    with open(src, "rb") as f:
+        return write_db(
+            out, ijson.items(f, "item"), updated_at,
+            progress=progress, tell=f.tell, total=src.stat().st_size or 1,
+        )
 
 
 def _db_stamp(db: Path) -> str:

@@ -23,6 +23,16 @@ _HEADERS = {"User-Agent": "mtg-rules-assistant/1.0", "Accept": "application/json
 
 _cache: CardCache | None = None
 _live_misses: dict[str, dict] = {}  # memoized live-API results for cache misses
+# Hard cap so a flood of distinct junk names can't grow the memo without bound.
+# On overflow the memo is simply dropped and rebuilt — it's only a cache.
+_MAX_LIVE_MISSES = 10_000
+
+
+def _remember(key: str, result: dict) -> dict:
+    if len(_live_misses) >= _MAX_LIVE_MISSES:
+        _live_misses.clear()
+    _live_misses[key] = result
+    return result
 
 
 def get_cache() -> CardCache:
@@ -66,13 +76,16 @@ def _live_lookup(name: str) -> dict:
         return {"error": f"network error contacting Scryfall: {e}"}
 
     if r.status_code == 404:
-        return {"error": f"no card found matching '{name}'"}
+        # Memoize the definitive no-match too: without this, every repeat of a
+        # junk name is a fresh outbound request — an easy way for one user to
+        # crawl Scryfall through us. Cleared on cache rebuild like the hits.
+        return _remember(key, {"error": f"no card found matching '{name}'"})
     if r.status_code != 200:
+        # Transient upstream trouble (5xx, rate limit) — do NOT memoize, so the
+        # next attempt can succeed once Scryfall recovers.
         return {"error": f"Scryfall returned HTTP {r.status_code}"}
 
-    result = project(r.json())
-    _live_misses[key] = result
-    return result
+    return _remember(key, project(r.json()))
 
 
 def lookup_card(name: str) -> dict:

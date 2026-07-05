@@ -16,6 +16,7 @@ last bulk build.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -24,7 +25,9 @@ from build_card_cache import normalize_name  # single source of truth for keys
 
 class CardCache:
     def __init__(self, db_path: str | None = None):
-        path = Path(db_path or Path(__file__).parent / "cards.db")
+        # Mirror build_card_cache.DEFAULT_OUT: explicit arg, then CARD_DB_PATH
+        # (persistent disk on the server), then next to the code for local dev.
+        path = Path(db_path or os.getenv("CARD_DB_PATH") or Path(__file__).parent / "cards.db")
         if not path.exists():
             raise FileNotFoundError(
                 "cards.db not found. Run `python build_card_cache.py` first."

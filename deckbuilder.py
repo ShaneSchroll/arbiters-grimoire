@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -31,14 +31,17 @@ router = APIRouter(prefix="/api", tags=["deckbuilder"])
 # Injected by server.configure() so we share one client + one model policy.
 _client = None
 _allowed_models: set[str] = set()
-_default_model = "claude-sonnet-4-6"
+_default_model = "claude-opus-4-8"
+_model_call_params: dict = {}
 
 
-def configure(client, allowed_models: set[str], default_model: str) -> None:
-    global _client, _allowed_models, _default_model
+def configure(client, allowed_models: set[str], default_model: str,
+              model_call_params: dict | None = None) -> None:
+    global _client, _allowed_models, _default_model, _model_call_params
     _client = client
     _allowed_models = set(allowed_models)
     _default_model = default_model
+    _model_call_params = dict(model_call_params or {})
 
 
 # ---- Input model (mirrors server.ChatRequest's caps) -----------------------
@@ -134,7 +137,9 @@ def _build_system(req: DeckRequest) -> tuple[list[dict], list[str]]:
 
 
 @router.post("/deckbuilder")
-def deckbuilder(req: DeckRequest, user=Depends(auth.require_user)):
+def deckbuilder(req: DeckRequest, request: Request, user=Depends(auth.require_user)):
+    # Same-origin as defense-in-depth, matching /api/chat: both spend API dollars.
+    auth.require_same_origin(request)
     if _client is None:
         raise HTTPException(503, "Deck builder is not configured.")
     if auth.chat_rate_limited(user["id"]):
@@ -144,8 +149,8 @@ def deckbuilder(req: DeckRequest, user=Depends(auth.require_user)):
     if not get_cache_safe():
         raise HTTPException(503, "Card cache is missing. Run `python build_card_cache.py`.")
 
-    permitted = _allowed_models if auth.can_use_opus(user) else {_default_model}
-    model = req.model if req.model in permitted else _default_model
+    # Any allowed model is available to every user; unknown models fall back.
+    model = req.model if req.model in _allowed_models else _default_model
 
     system, _ = _build_system(req)
 
@@ -175,10 +180,11 @@ def deckbuilder(req: DeckRequest, user=Depends(auth.require_user)):
             for _ in range(6):  # safety cap on tool round-trips
                 with _client.messages.stream(
                     model=model,
-                    max_tokens=2048,
+                    max_tokens=8192,
                     system=system,
                     tools=[CARD_TOOL],
                     messages=messages,
+                    **_model_call_params.get(model, {}),
                 ) as stream:
                     for chunk in stream.text_stream:
                         answer_parts.append(chunk)

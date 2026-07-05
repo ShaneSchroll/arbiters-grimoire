@@ -1,8 +1,8 @@
 """
-server.py - Web backend for the MTG Rules Oracle.
+server.py - Web backend for the Arbiters Grimoire.
 
 Flow for each user question:
-  1. Retrieve the most relevant rulebook chunks (BM25 over your PDF).
+  1. Retrieve the most relevant rulebook chunks (BM25 over your TXT).
   2. Send them to Claude alongside an MTG-expert system prompt.
   3. If Claude asks to look up a card, call Scryfall and feed the result back.
   4. Return Claude's final answer plus the rule sources used.
@@ -51,70 +51,140 @@ load_dotenv(BASE_DIR / ".env")
 client = Anthropic()  # reads ANTHROPIC_API_KEY
 retriever = Retriever()
 
+# Exact per-subrule text index for the citation popover. rules.json chunks are
+# keyed by parent rule (e.g. "510.1"), with subrules ("510.1c") living inside
+# the chunk text - so a citation like 510.1c isn't directly addressable there.
+# We flatten every numbered line into {number -> paragraph text} once at startup
+# so /api/rule/<id> can return the exact text a citation points at.
+_RULE_LINE = re.compile(r"^(\d{3}\.\d+[a-z]?)\.?\s+(.*)$")
 
-def find_index_html() -> Path:
-    """Locate index.html"""
-    for candidate in (
-        BASE_DIR / "static" / "index.html",
-        BASE_DIR / "index.html",
-        BASE_DIR / "index",
-    ):
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "Could not find index.html. Put it next to server.py "
-        "(or in a 'static' subfolder)."
+
+def _build_rule_index(chunks) -> dict[str, str]:
+    idx: dict[str, str] = {}
+    for chunk in chunks:
+        current = None
+        for raw in chunk["text"].split("\n"):
+            line = raw.strip()
+            if not line:
+                continue
+            m = _RULE_LINE.match(line)
+            if m:
+                current = m.group(1)
+                idx[current] = m.group(2).strip()
+            elif current:
+                # Continuation / "Example:" line belongs to the current subrule.
+                idx[current] += " " + line
+    return idx
+
+
+RULE_INDEX = _build_rule_index(retriever.chunks)
+
+
+# ---------------------------------------------------------------------------
+# Frontend: served straight out of Astro's build output (dist/).
+#
+# `npm run build` emits one folder per page (dist/<route>/index.html), hashed
+# JS/CSS into dist/_astro/, and copies public/ assets (favicons) to the dist
+# root. The routes below repoint the app's existing URLs at those built files,
+# replacing the hand-written HTML + /static layout used before the migration.
+# Public URLs are intentionally unchanged - only the file each one serves moved.
+# ---------------------------------------------------------------------------
+DIST_DIR = BASE_DIR / "dist"
+ASTRO_ASSETS = DIST_DIR / "_astro"
+DOCS_JSON = BASE_DIR / "docs.json"
+
+
+def _load_cr_effective_date() -> str | None:
+    """The Comprehensive Rules' effective date, captured into docs.json by
+    ingest.py. Read once at startup for the CR badge in the chat header; a
+    missing/unreadable value is fine — the UI just hides the chip. Refreshes on
+    restart, in step with the retriever's rules.json load."""
+    try:
+        with open(DOCS_JSON, encoding="utf-8") as f:
+            date = json.load(f).get("effective_date")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return date if isinstance(date, str) and date.strip() else None
+
+
+CR_EFFECTIVE_DATE = _load_cr_effective_date()
+
+
+def _serve_page(rel: str) -> FileResponse:
+    """FileResponse for a built page (``rel`` is a path relative to dist/).
+
+    Resolved per request, so editing a page and re-running ``npm run build``
+    shows up on the next reload with no server restart. Returns a clear 503 when
+    the build is missing.
+    """
+    page = DIST_DIR / rel
+    if page.is_file():
+        return FileResponse(page)
+    raise HTTPException(
+        status_code=503,
+        detail="Frontend build missing. Run `npm run build` to generate dist/.",
     )
 
 
-INDEX_HTML = find_index_html()
-PAGES_DIR = BASE_DIR / "pages"
-TIPS_HTML = PAGES_DIR / "tips.html"
-RULES_HTML = PAGES_DIR / "rules.html"
-DOCS_JSON = BASE_DIR / "docs.json"
-AUTH_PAGES = BASE_DIR / "auth_pages"
+def _dist_file(rel: str, *, cache: str | None = None) -> FileResponse:
+    """Serve a single file from the dist root (e.g. a favicon). 404s when the
+    build hasn't produced it, rather than the 503 used for whole pages."""
+    f = DIST_DIR / rel
+    if not f.is_file():
+        raise HTTPException(status_code=404)
+    return FileResponse(f, headers={"Cache-Control": cache} if cache else None)
 
+# The one model every signed-in user gets: Claude Opus 4.8. It is both the sole
+# option and the global default, with no per-user gating - everyone can use it.
+ALLOWED_MODELS = {"claude-opus-4-8"}
+DEFAULT_MODEL = "claude-opus-4-8"
 
-def _find_admin_html() -> Path | None:
-    """Resolve admin.html across the flat-repo and built layouts. Returns None
-    if not found, so the route can give a clear 'not deployed' message instead
-    of crashing the whole app at import time."""
-    for candidate in (
-        AUTH_PAGES / "admin.html",
-        BASE_DIR / "static" / "admin.html",
-        PAGES_DIR / "admin.html",
-        BASE_DIR / "admin.html",
-    ):
-        if candidate.exists():
-            return candidate
-    return None
+# Per-model extra params merged into each Messages API call. Opus 4.8 runs with
+# adaptive thinking (the model decides when and how much to think) at high
+# reasoning effort.
+MODEL_CALL_PARAMS = {
+    "claude-opus-4-8": {
+        # Adaptive: think on complex queries, answer instantly on simple ones.
+        # display "omitted" hides the thought summary (already the Opus 4.8
+        # default) - the model still thinks and is billed for it either way,
+        # so this is a visibility setting, not a way to save tokens.
+        "thinking": {"type": "adaptive", "display": "omitted"},
+        "output_config": {"effort": "high"},
+    },
+}
 
-
-ADMIN_HTML = _find_admin_html()
-
-# Models available in the dropdown. Sonnet is the default - faster and cheaper
-# for everyday questions; Opus is opt-in via the dropdown for hard questions.
-ALLOWED_MODELS = {"claude-sonnet-4-6", "claude-opus-4-7"}
-DEFAULT_MODEL = "claude-sonnet-4-6"
-
-deckbuilder.configure(client, ALLOWED_MODELS, DEFAULT_MODEL)
+deckbuilder.configure(client, ALLOWED_MODELS, DEFAULT_MODEL, MODEL_CALL_PARAMS)
 
 # Static, cacheable persona. Kept separate from the per-question rules text so
 # it can be marked with cache_control and reused cheaply across requests.
-SYSTEM_PERSONA = """You are the MTG Rules Oracle, a meticulous judge-level \
+SYSTEM_PERSONA = """You are the MTG Arbiter, a meticulous judge-level \
 expert on Magic: The Gathering rules and card interactions.
 
-How to answer:
-- Reason strictly from the RULEBOOK EXCERPTS provided in the user turn. They \
-are authoritative. If they are insufficient, say so plainly rather than \
-guessing.
-- Cite the specific rule numbers you rely on, e.g. "(509.2)".
+How to reason:
+- Reason strictly from the RULEBOOK EXCERPTS provided in the user turn; they \
+are authoritative. If they are insufficient, say so plainly rather than guessing.
 - When a question names a specific card, use the lookup_card tool to get its \
 exact current Oracle text before ruling - printed wording is often outdated.
-- Walk through interactions step by step (priority, the stack, triggered \
+- Work through the interaction in order (priority, the stack, layers, triggered \
 abilities, state-based actions) so the player learns the "why".
-- Be precise and concise. Distinguish what the rules state from your own \
-inference, and flag genuinely ambiguous cases."""
+
+OUTPUT FORMAT - follow this EXACTLY and consistently for every ruling:
+1. The FIRST line must be the verdict, written as `VERDICT: <one concise \
+sentence>` - e.g. `VERDICT: Yes - that damage assignment is legal.` Give a \
+direct answer; if it genuinely depends, write `VERDICT: It depends - <the key \
+factor>.`
+2. Then a blank line, then the explanation as GitHub-flavored Markdown.
+3. In the explanation, use a numbered list (`1.`, `2.`, `3.`) for step-by-step \
+reasoning. Use **bold** for key rules terms and wrap short game terms in \
+`inline code` (e.g. `combat damage step`).
+4. Cite the specific Comprehensive Rules number inline, right where it applies, \
+as the bare number in parentheses - e.g. (702.2b). Cite the exact subrule that \
+governs (702.2b), not just its parent (702.2).
+5. Wrap every specific card name in double square brackets so it links to the \
+card, e.g. [[Basilisk Collar]]. Bracket only real card names, never rules terms.
+
+Be precise and concise. Distinguish what the rules state from your own \
+inference, and flag genuinely ambiguous cases in the verdict."""
 
 
 @asynccontextmanager
@@ -125,8 +195,9 @@ async def lifespan(_: FastAPI):
 _CSP = (
     "default-src 'self'; "
     "img-src 'self' data:; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "font-src 'self' https://fonts.gstatic.com; "
+    # Astro pages load the Inter webfont stylesheet + woff2 files from rsms.me.
+    "style-src 'self' 'unsafe-inline' https://rsms.me https://fonts.googleapis.com; "
+    "font-src 'self' https://rsms.me https://fonts.gstatic.com; "
     "script-src 'self' 'unsafe-inline'; "
     "connect-src 'self'; "
     "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
@@ -163,16 +234,60 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
-app = FastAPI(title="MTG Rules Oracle", lifespan=lifespan)
+class ImmutableStaticFiles(StaticFiles):
+    """StaticFiles for Astro's /_astro bundles. Their filenames are content
+    hashed, so a given URL never changes meaning - safe to cache hard. The
+    browser refetches only when the hash (and thus the URL) changes."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers.setdefault(
+            "Cache-Control", "public, max-age=31536000, immutable"
+        )
+        return response
+
+
+# docs_url/redoc_url/openapi_url disabled: the interactive docs would hand
+# anonymous visitors the full API map, including every admin route.
+app = FastAPI(
+    title="Arbiters Grimoire",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(auth.router)
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
-# Caps on chat input
+# Astro's hashed JS/CSS bundles. check_dir=False so the app still boots when
+# dist/ hasn't been built yet (the page routes return a clear 503 in that case).
+app.mount(
+    "/_astro",
+    ImmutableStaticFiles(directory=ASTRO_ASSETS, check_dir=False),
+    name="astro",
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico():
+    return _dist_file("favicon.ico", cache="public, max-age=86400")
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon_svg():
+    return _dist_file("favicon.svg", cache="public, max-age=86400")
+
+# Caps on chat input. These bound how large a conversation can get before we
+# ask the user to start a new chat - they are NOT model context limits (these
+# models have ~1M-token windows). max_tokens (8192) is shared by adaptive
+# thinking and the visible answer, but only the visible answer is stored back
+# into history - concise rules answers stay well under MAX_MESSAGE_CHARS when
+# re-sent; MAX_TOTAL_CHARS allows several turns before the client nudges toward
+# a fresh chat (HTTP 422).
 MAX_MESSAGES = 15
-MAX_MESSAGE_CHARS = 8_000
-MAX_TOTAL_CHARS = 24_000
+MAX_MESSAGE_CHARS = 12_000
+MAX_TOTAL_CHARS = 48_000
 
 
 class ChatMessage(BaseModel):
@@ -239,7 +354,11 @@ def _sse(payload: dict) -> str:
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest, user=Depends(auth.require_user)):
+def chat(req: ChatRequest, request: Request, user=Depends(auth.require_user)):
+    # Same-origin as defense-in-depth (matches the conversations/admin routes):
+    # this endpoint spends real API dollars, so it gets the same guard even
+    # though SameSite=Lax already keeps cross-site POSTs cookie-less.
+    auth.require_same_origin(request)
     if auth.chat_rate_limited(user["id"]):
         raise HTTPException(
             status_code=429,
@@ -251,12 +370,9 @@ def chat(req: ChatRequest, user=Depends(auth.require_user)):
             detail="Daily usage budget reached. It resets at 00:00 UTC.",
         )
 
-    # Opus is admins-only by default; other users need an explicit grant. The
-    # frontend hides the option for ineligible users, but never trust the
-    # client - enforce here. An ineligible request silently runs on the
-    # default (Sonnet) rather than erroring.
-    permitted = ALLOWED_MODELS if auth.can_use_opus(user) else {DEFAULT_MODEL}
-    model = req.model if req.model in permitted else DEFAULT_MODEL
+    # Every signed-in user may pick any allowed model; an unknown or
+    # unsupported model silently falls back to the default rather than erroring.
+    model = req.model if req.model in ALLOWED_MODELS else DEFAULT_MODEL
 
     last_user = next(
         (m.content for m in reversed(req.messages) if m.role == "user"),
@@ -289,10 +405,11 @@ def chat(req: ChatRequest, user=Depends(auth.require_user)):
             for _ in range(6):  # safety cap on tool round-trips
                 with client.messages.stream(
                     model=model,
-                    max_tokens=2048,
+                    max_tokens=8192,
                     system=system,
                     tools=[CARD_TOOL],
                     messages=messages,
+                    **MODEL_CALL_PARAMS.get(model, {}),
                 ) as stream:
                     for chunk in stream.text_stream:
                         answer_parts.append(chunk)
@@ -349,28 +466,128 @@ def chat(req: ChatRequest, user=Depends(auth.require_user)):
     )
 
 
+@app.get("/api/rule/{rule_id}")
+def rule_text(rule_id: str, _user=Depends(auth.require_user)):
+    """Exact text for a single Comprehensive Rules citation (e.g. 510.1c), so the
+    client citation popover/sheet can show the real rule rather than a fallback."""
+    text = RULE_INDEX.get(rule_id.strip())
+    if not text:
+        raise HTTPException(status_code=404, detail=f"No rule {rule_id}.")
+    return {"rule": rule_id, "text": text}
+
+
+# Longest real card name (an Un-set joke card) is ~141 chars; anything past
+# this is garbage and shouldn't reach the cache or the live Scryfall fallback.
+MAX_CARD_NAME_CHARS = 200
+
+
+@app.get("/api/card")
+def card_text(name: str, user=Depends(auth.require_user)):
+    """Text-only card preview (name, cost, type, Oracle text) for card links in
+    answers. Cache-first via mtg_api; no imagery, per the legal constraint."""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A card name is required.")
+    if len(name) > MAX_CARD_NAME_CHARS:
+        raise HTTPException(status_code=400, detail="Card name is too long.")
+    if auth.card_rate_limited(user["id"]):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many card lookups. Please wait a moment and try again.",
+        )
+    hit = lookup_card(name)
+    if not hit or hit.get("error"):
+        raise HTTPException(status_code=404, detail=f"No card matching '{name}'.")
+    return {
+        "name": hit.get("name") or name,
+        "cost": hit.get("mana_cost") or "",
+        "type": hit.get("type_line") or "",
+        "text": hit.get("oracle_text") or "",
+    }
+
+
+# ----- Conversation history (sidebar archive; capped per user in auth.py) -----
+
+class ConvMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=MAX_MESSAGE_CHARS)
+
+
+class ConvSave(BaseModel):
+    id: int | None = None
+    title: str = Field(min_length=1, max_length=200)
+    format: str = Field(default="Commander", max_length=40)
+    messages: list[ConvMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
+
+
+@app.get("/api/conversations")
+def conversations_list(user=Depends(auth.require_user)):
+    return {"conversations": auth.list_conversations(user["id"])}
+
+
+@app.post("/api/conversations")
+def conversations_save(req: ConvSave, request: Request, user=Depends(auth.require_user)):
+    auth.require_same_origin(request)
+    messages_json = json.dumps(
+        [m.model_dump() for m in req.messages], ensure_ascii=False
+    )
+    cid = auth.save_conversation(
+        user["id"], req.id, req.title.strip()[:200], req.format, messages_json
+    )
+    return {"id": cid}
+
+
+@app.get("/api/conversations/{conv_id}")
+def conversations_get(conv_id: int, user=Depends(auth.require_user)):
+    conv = auth.get_conversation(user["id"], conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    conv["messages"] = json.loads(conv["messages"])
+    return conv
+
+
+@app.delete("/api/conversations/{conv_id}")
+def conversations_delete(conv_id: int, request: Request, user=Depends(auth.require_user)):
+    auth.require_same_origin(request)
+    if not auth.delete_conversation(user["id"], conv_id):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"ok": True}
+
+
 @app.get("/")
 def index(request: Request):
     user = auth.get_current_user(request)
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
-    return FileResponse(INDEX_HTML)
+    return _serve_page("index.html")
 
 
-@app.get("/pages/tips")
-def tips_page(request: Request):
+# In-app pages from the redesigned nav. Auth-gated like the chat root: these
+# are app chrome, not public marketing pages. (These replace the pre-redesign
+# /pages/tips and /pages/rules routes, whose dist targets no longer exist.)
+
+@app.get("/help")
+def help_page(request: Request):
     user = auth.get_current_user(request)
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
-    return FileResponse(TIPS_HTML)
+    return _serve_page("help/index.html")
 
 
-@app.get("/pages/rules")
-def rules_page(request: Request):
+@app.get("/rulebook")
+def rulebook_page(request: Request):
     user = auth.get_current_user(request)
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
-    return FileResponse(RULES_HTML)
+    return _serve_page("rulebook/index.html")
+
+
+@app.get("/about")
+def about_page(request: Request):
+    user = auth.get_current_user(request)
+    if not user or not user["approved"]:
+        return RedirectResponse("/login", status_code=302)
+    return _serve_page("about/index.html")
 
 
 @app.get("/docs.json")
@@ -381,24 +598,32 @@ def docs_json(_user=Depends(auth.require_user)):
     if not DOCS_JSON.exists():
         raise HTTPException(
             status_code=503,
-            detail="docs.json is missing. Run `python ingest.py <pdf>` to generate it.",
+            detail="docs.json is missing. Run `python ingest.py rules.txt` to generate it.",
         )
     return FileResponse(DOCS_JSON, media_type="application/json")
 
 
+@app.get("/api/cr-version")
+def cr_version():
+    """Effective date of the loaded Comprehensive Rules, for the CR badge in the
+    chat header. Public: it's just non-sensitive version metadata (the date is
+    published on WotC's site), so it needn't be auth-gated like the rules text."""
+    return {"effective_date": CR_EFFECTIVE_DATE}
+
+
 @app.get("/login")
 def login_page():
-    return FileResponse(AUTH_PAGES / "login.html")
+    return _serve_page("auth/login/index.html")
 
 
 @app.get("/register")
 def register_page():
-    return FileResponse(AUTH_PAGES / "register.html")
+    return _serve_page("auth/register/index.html")
 
 
 @app.get("/reset")
 def reset_page():
-    return FileResponse(AUTH_PAGES / "reset.html")
+    return _serve_page("auth/reset/index.html")
 
 
 # ===================== Admin panel (web) =====================
@@ -428,7 +653,6 @@ def _user_view(row) -> dict:
         "email": row["email"],
         "approved": bool(row["approved"]),
         "is_admin": bool(row["is_admin"]),
-        "opus_allowed": bool(row["opus_allowed"]) if "opus_allowed" in row.keys() else False,
         "created_at": row["created_at"],
         "budget_is_default": raw is None,
         "budget_unlimited": budget < 0,
@@ -470,15 +694,6 @@ def admin_set_admin(payload: dict = Body(...), admin=Depends(_admin_guard)):
     if not make_admin and target["is_admin"] and auth.count_admins() <= 1:
         raise HTTPException(400, "Refusing to remove the only remaining admin.")
     if not auth.set_admin(email, make_admin):
-        raise HTTPException(404, f"No such user: {email}")
-    return {"ok": True}
-
-
-@admin_router.post("/opus")
-def admin_set_opus(payload: dict = Body(...), _admin=Depends(_admin_guard)):
-    email = payload.get("email", "")
-    allowed = bool(payload.get("opus_allowed", False))
-    if not auth.set_opus_allowed(email, allowed):
         raise HTTPException(404, f"No such user: {email}")
     return {"ok": True}
 
@@ -553,8 +768,6 @@ def admin_create(payload: dict = Body(...), _admin=Depends(_admin_guard), reques
         auth.set_approved(norm, True)
     if payload.get("is_admin"):
         auth.set_admin(norm, True)
-    if payload.get("opus_allowed"):
-        auth.set_opus_allowed(norm, True)
     token = auth.create_reset_token(uid)
     base = os.getenv("APP_BASE_URL", "").rstrip("/")
     if not base and request is not None:
@@ -581,7 +794,7 @@ def deckbuilder_page(request: Request):
     user = auth.get_current_user(request)
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
-    return FileResponse(PAGES_DIR / "deckbuilder.html")
+    return _serve_page("deckbuilder/index.html")
 
 
 @app.get("/admin")
@@ -592,10 +805,4 @@ def admin_page(request: Request):
     if not user["is_admin"]:
         # Approved non-admins get bounced to the app rather than the panel.
         return RedirectResponse("/", status_code=302)
-    if ADMIN_HTML is None:
-        raise HTTPException(
-            status_code=503,
-            detail="admin.html is not deployed. Place it alongside your other "
-                   "auth pages (login.html/register.html).",
-        )
-    return FileResponse(ADMIN_HTML)
+    return _serve_page("admin/index.html")

@@ -45,6 +45,15 @@ REGISTER_MAX = 5
 CHAT_WINDOW = timedelta(minutes=1)
 CHAT_MAX = 5
 
+# Card-preview lookups per user (/api/card). Generous — hovers are cheap and
+# cache-first — but bounds how hard one user can drive live Scryfall fallbacks.
+CARD_WINDOW = timedelta(minutes=1)
+CARD_MAX = 30
+
+# Trusted reverse proxies in front of the app, counted from the connection
+# inward: Render alone = 1; Cloudflare -> Render = 2. The env var MUST match
+# the real chain: too low and per-IP rate limits key on a proxy's (shared) IP;
+# too high and clients can spoof their IP via X-Forwarded-For.
 TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
 
 # ---------- spend accounting ----------
@@ -53,10 +62,7 @@ DEFAULT_DAILY_BUDGET_MICROS = int(
 )
 
 PRICING = {
-    "claude-sonnet-4-6": {
-        "input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30,
-    },
-    "claude-opus-4-7": {
+    "claude-opus-4-8": {
         "input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50,
     },
 }
@@ -68,6 +74,25 @@ _FALLBACK_RATE = {
 }
 
 PASSWORD_MIN_LEN = 12
+# Upper bound applied at the API boundary. Without one, uvicorn accepts
+# arbitrarily large bodies and Argon2 would grind through a multi-megabyte
+# "password" — free CPU burn for an attacker. 128 chars is far beyond any
+# real passphrase.
+PASSWORD_MAX_LEN = 128
+
+# Optional display name shown in the sidebar. Kept short; falls back to the
+# email when unset. Trimmed and capped so a long value can't bloat the row.
+MAX_NAME_LEN = 60
+
+
+def _clean_name(name: Optional[str]) -> Optional[str]:
+    """Normalize an optional display name: trim, cap length, and treat blank as
+    unset (stored as NULL so the UI can fall back to the email)."""
+    if not name:
+        return None
+    name = name.strip()[:MAX_NAME_LEN]
+    return name or None
+
 
 _ph = PasswordHasher()
 # Used to keep the argon2 verify cost constant when the email doesn't exist,
@@ -145,11 +170,17 @@ _login_fail = _RateLimiter(LOGIN_MAX_FAILS, LOGIN_WINDOW)
 _login_ip = _RateLimiter(LOGIN_IP_MAX_FAILS, LOGIN_WINDOW)
 _register_limit = _RateLimiter(REGISTER_MAX, REGISTER_WINDOW)
 _chat_limit = _RateLimiter(CHAT_MAX, CHAT_WINDOW)
+_card_limit = _RateLimiter(CARD_MAX, CARD_WINDOW)
 
 
 def chat_rate_limited(user_id: int) -> bool:
     """Record a chat request for this user; True if they are now over CHAT_MAX."""
     return _chat_limit.hit(str(user_id))
+
+
+def card_rate_limited(user_id: int) -> bool:
+    """Record a card lookup for this user; True if they are now over CARD_MAX."""
+    return _card_limit.hit(str(user_id))
 
 
 # ---------- low-level helpers ----------
@@ -219,6 +250,17 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_usage_user_time
               ON usage_ledger(user_id, created_at);
+            CREATE TABLE IF NOT EXISTS conversations (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              title      TEXT    NOT NULL,
+              format     TEXT    NOT NULL DEFAULT 'Commander',
+              messages   TEXT    NOT NULL,   -- JSON: [{role, content}] display turns
+              created_at TEXT    NOT NULL,
+              updated_at TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_user
+              ON conversations(user_id, updated_at);
             """
         )
         _migrate(db)
@@ -231,13 +273,18 @@ def _migrate(db: sqlite3.Connection) -> None:
     never touches existing rows. (CREATE TABLE IF NOT EXISTS won't add a new
     column to a table that already exists, hence this guarded ALTER.)"""
     cols = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+    if "name" not in cols:
+        # Optional display name captured at registration. NULL means "unset",
+        # in which case the UI falls back to the email's local-part.
+        db.execute("ALTER TABLE users ADD COLUMN name TEXT")
     if "daily_budget_micros" not in cols:
         # Nullable: NULL means "use DEFAULT_DAILY_BUDGET_MICROS". A negative
         # value means unlimited. A non-negative value is a per-user override.
         db.execute("ALTER TABLE users ADD COLUMN daily_budget_micros INTEGER")
     if "opus_allowed" not in cols:
-        # 0/1 flag. Admins always get Opus regardless (see can_use_opus). The
-        # DEFAULT 0 backfills every existing row to "off" in a single statement.
+        # Vestigial: per-user Opus gating was removed (every user can use every
+        # model now). Retained so existing and fresh DBs share one schema;
+        # nothing reads it anymore.
         db.execute("ALTER TABLE users ADD COLUMN opus_allowed INTEGER NOT NULL DEFAULT 0")
 
 
@@ -387,24 +434,24 @@ def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
         return db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
-def _insert_user(email: str, pw_hash: str) -> int:
+def _insert_user(email: str, pw_hash: str, name: Optional[str] = None) -> int:
     """Insert a pre-normalized email and pre-computed hash. Caller owns hashing
     so register() can hash unconditionally (constant timing) without this
     function hashing a second time."""
     with _db() as db:
         cur = db.execute(
-            "INSERT INTO users (email, password_hash, approved, is_admin, created_at) "
-            "VALUES (?, ?, 0, 0, ?)",
-            (email, pw_hash, _now().isoformat()),
+            "INSERT INTO users (email, password_hash, name, approved, is_admin, created_at) "
+            "VALUES (?, ?, ?, 0, 0, ?)",
+            (email, pw_hash, name, _now().isoformat()),
         )
         return cur.lastrowid
 
 
-def create_user(email: str, password: str) -> int:
+def create_user(email: str, password: str, name: Optional[str] = None) -> int:
     email = _normalize_email(email)
     if len(password) < PASSWORD_MIN_LEN:
         raise ValueError(f"Password must be at least {PASSWORD_MIN_LEN} characters.")
-    return _insert_user(email, _ph.hash(password))
+    return _insert_user(email, _ph.hash(password), _clean_name(name))
 
 
 def verify_password(stored_hash: str, password: str) -> bool:
@@ -488,7 +535,7 @@ def consume_reset_token(token: str) -> Optional[int]:
 def list_users() -> list[sqlite3.Row]:
     with _db() as db:
         return db.execute(
-            "SELECT id, email, approved, is_admin, opus_allowed, "
+            "SELECT id, email, approved, is_admin, "
             "daily_budget_micros, created_at FROM users ORDER BY created_at"
         ).fetchall()
 
@@ -518,31 +565,6 @@ def set_admin(email: str, is_admin: bool) -> bool:
         return cur.rowcount > 0
 
 
-def set_opus_allowed(email: str, allowed: bool) -> bool:
-    """Grant or revoke Opus access for a specific (non-admin) user. Admins can
-    always use Opus regardless of this flag; see can_use_opus."""
-    with _db() as db:
-        cur = db.execute(
-            "UPDATE users SET opus_allowed = ? WHERE email = ?",
-            (1 if allowed else 0, _normalize_email(email)),
-        )
-        return cur.rowcount > 0
-
-
-def can_use_opus(user: sqlite3.Row) -> bool:
-    """True if this user may select the Opus model: admins always, plus anyone
-    explicitly granted access. Tolerant of a missing/NULL column."""
-    try:
-        if user["is_admin"]:
-            return True
-    except (KeyError, IndexError):
-        pass
-    try:
-        return bool(user["opus_allowed"])
-    except (KeyError, IndexError):
-        return False
-
-
 def delete_user(email: str) -> bool:
     with _db() as db:
         cur = db.execute("DELETE FROM users WHERE email = ?", (_normalize_email(email),))
@@ -556,17 +578,26 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 class RegisterReq(BaseModel):
     email: str
-    password: str = Field(min_length=PASSWORD_MIN_LEN)
+    password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
+    # Optional display name. Bounded generously here; _clean_name trims and caps
+    # it to MAX_NAME_LEN before storage.
+    name: Optional[str] = Field(default=None, max_length=200)
 
 
 class LoginReq(BaseModel):
     email: str
-    password: str
+    # Same cap as registration, so no legitimately-set password is rejected
+    # here while oversized bodies never reach Argon2.
+    password: str = Field(max_length=PASSWORD_MAX_LEN)
+    # When false, the session cookie is dropped when the browser closes; when
+    # true (the default, matching the "keep me signed in" checkbox), it persists
+    # for SESSION_TTL. Defaults true so an omitted field keeps prior behavior.
+    remember: bool = True
 
 
 class ResetReq(BaseModel):
-    token: str
-    new_password: str = Field(min_length=PASSWORD_MIN_LEN)
+    token: str = Field(max_length=256)
+    new_password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
 
 
 def _client_ip(request: Request) -> str:
@@ -597,11 +628,17 @@ def _is_secure(request: Request) -> bool:
     return request.headers.get("x-forwarded-proto", "").lower() == "https"
 
 
-def _set_session_cookie(response: Response, token: str, request: Request) -> None:
+def _set_session_cookie(
+    response: Response, token: str, request: Request, remember: bool = True
+) -> None:
+    # remember -> persistent cookie for SESSION_TTL; otherwise a session cookie
+    # (no Max-Age) the browser drops on close. The server-side session row keeps
+    # its own SESSION_TTL expiry either way; a session cookie just means the
+    # browser stops presenting the token sooner.
     response.set_cookie(
         SESSION_COOKIE,
         token,
-        max_age=int(SESSION_TTL.total_seconds()),
+        max_age=int(SESSION_TTL.total_seconds()) if remember else None,
         httponly=True,
         secure=_is_secure(request),
         samesite="lax",
@@ -680,7 +717,7 @@ def register(req: RegisterReq, request: Request):
     pw_hash = _ph.hash(req.password)
     if not get_user_by_email(email):
         try:
-            _insert_user(email, pw_hash)
+            _insert_user(email, pw_hash, _clean_name(req.name))
         except sqlite3.IntegrityError:
             pass  # Lost a race; treat as success.
 
@@ -695,7 +732,7 @@ def login(req: LoginReq, request: Request, response: Response):
     try:
         email = _normalize_email(req.email)
     except EmailNotValidError:
-        raise HTTPException(401, "Invalid credentials.")
+        raise HTTPException(401, "Invalid Credentials. Check your input.")
 
     ip = _client_ip(request)
     fail_key = f"{ip}\x00{email}"
@@ -710,18 +747,18 @@ def login(req: LoginReq, request: Request, response: Response):
     if not user or not pw_ok:
         _login_fail.record(fail_key)
         _login_ip.record(ip)
-        raise HTTPException(401, "Invalid credentials.")
+        raise HTTPException(401, "Invalid Credentials. Check your input.")
 
     if not user["approved"]:
         # Don't differentiate "wrong password" from "not approved" to outsiders;
         # the approval message comes through the registration response.
-        raise HTTPException(403, "Account not yet approved.")
+        raise HTTPException(403, "Account is pending approval.")
 
     # Clear the per-account counter on success. The per-IP counter is left to
     # age out so one success can't reset a spraying attack from the same IP.
     _login_fail.clear(fail_key)
     token = create_session(user["id"])
-    _set_session_cookie(response, token, request)
+    _set_session_cookie(response, token, request, remember=req.remember)
     return {"email": user["email"], "is_admin": bool(user["is_admin"])}
 
 
@@ -741,8 +778,8 @@ def me(user: sqlite3.Row = Depends(require_user)):
     unlimited = budget < 0
     return {
         "email": user["email"],
+        "name": user["name"],
         "is_admin": bool(user["is_admin"]),
-        "can_use_opus": can_use_opus(user),
         "spent_micros": spent,
         "budget_micros": budget,
         "unlimited": unlimited,
@@ -761,4 +798,108 @@ def reset_password(req: ResetReq, request: Request, response: Response):
     except ValueError as e:
         raise HTTPException(400, str(e))
     _clear_session_cookie(response, request)
-    return {"ok": True, "message": "Password updated. Please sign in."}
+    return {"ok": True, "message": "Password updated. Please sign in again."}
+
+
+# ---------- conversation history ----------
+# Each user keeps only their most recent chats in the sidebar; older ones are
+# pruned so the table can't grow without bound on the persistent disk.
+MAX_CONVERSATIONS = 5
+
+
+def save_conversation(
+    user_id: int,
+    conv_id: int | None,
+    title: str,
+    fmt: str,
+    messages_json: str,
+) -> int:
+    """Insert a new conversation or update an existing one owned by user_id,
+    then prune everything past the MAX_CONVERSATIONS most recent. Returns the
+    conversation id (new or existing)."""
+    now = _now().isoformat()
+    with _db() as db:
+        row = None
+        if conv_id is not None:
+            row = db.execute(
+                "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
+                (conv_id, user_id),
+            ).fetchone()
+
+        if row:
+            db.execute(
+                "UPDATE conversations SET title = ?, format = ?, messages = ?, "
+                "updated_at = ? WHERE id = ?",
+                (title, fmt, messages_json, now, row["id"]),
+            )
+            cid = row["id"]
+        else:
+            cur = db.execute(
+                "INSERT INTO conversations (user_id, title, format, messages, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, title, fmt, messages_json, now, now),
+            )
+            cid = cur.lastrowid
+
+        # Prune older conversations beyond the cap for this user.
+        db.execute(
+            """
+            DELETE FROM conversations
+             WHERE user_id = ?
+               AND id NOT IN (
+                 SELECT id FROM conversations
+                  WHERE user_id = ?
+                  ORDER BY updated_at DESC, id DESC
+                  LIMIT ?
+               )
+            """,
+            (user_id, user_id, MAX_CONVERSATIONS),
+        )
+        return cid
+
+
+def list_conversations(user_id: int, limit: int = MAX_CONVERSATIONS) -> list[dict]:
+    """The user's most recent conversations (metadata only, newest first)."""
+    with _db() as db:
+        rows = db.execute(
+            "SELECT id, title, format, updated_at FROM conversations "
+            "WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "format": r["format"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+
+
+def get_conversation(user_id: int, conv_id: int) -> dict | None:
+    """Full conversation (including its stored messages) if owned by user_id."""
+    with _db() as db:
+        r = db.execute(
+            "SELECT id, title, format, messages, updated_at FROM conversations "
+            "WHERE id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+    if not r:
+        return None
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "format": r["format"],
+        "messages": r["messages"],
+        "updated_at": r["updated_at"],
+    }
+
+
+def delete_conversation(user_id: int, conv_id: int) -> bool:
+    with _db() as db:
+        cur = db.execute(
+            "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+            (conv_id, user_id),
+        )
+        return cur.rowcount > 0

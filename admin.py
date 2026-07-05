@@ -32,7 +32,7 @@ def cmd_list(_):
     if not users:
         print("(no users)")
         return
-    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'OPUS':5} {'BUDGET/DAY':12} CREATED")
+    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'BUDGET/DAY':12} CREATED")
     for u in users:
         raw = u["daily_budget_micros"]
         if raw is None:
@@ -41,12 +41,10 @@ def cmd_list(_):
             budget = "unlimited"
         else:
             budget = f"${raw / 1_000_000:.2f}"
-        opus = "yes" if (u["is_admin"] or u["opus_allowed"]) else "no"
         print(
             f"{u['email']:36} "
             f"{'yes' if u['approved'] else 'no':5} "
             f"{'yes' if u['is_admin'] else 'no':6} "
-            f"{opus:5} "
             f"{budget:12} "
             f"{u['created_at']}"
         )
@@ -88,15 +86,6 @@ def cmd_revoke(args):
 def cmd_make_admin(args):
     if auth.set_admin(args.email, True):
         print(f"{args.email} is now admin")
-    else:
-        sys.exit(f"No such user: {args.email}")
-
-
-def cmd_opus(args):
-    allowed = args.on  # argparse guarantees exactly one of --on/--off
-    if auth.set_opus_allowed(args.email, allowed):
-        state = "enabled" if allowed else "disabled"
-        print(f"Opus access {state} for {args.email}")
     else:
         sys.exit(f"No such user: {args.email}")
 
@@ -207,13 +196,6 @@ def main():
     sp = sub.add_parser("usage", help="Show a user's spend so far today")
     sp.add_argument("email")
     sp.set_defaults(func=cmd_usage)
-
-    sp = sub.add_parser("opus", help="Grant or revoke Opus model access")
-    sp.add_argument("email")
-    g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--on", action="store_true", help="Allow this user to use Opus")
-    g.add_argument("--off", action="store_true", help="Disallow Opus for this user")
-    sp.set_defaults(func=cmd_opus)
 
     args = p.parse_args()
     args.func(args)
