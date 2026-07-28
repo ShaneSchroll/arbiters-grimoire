@@ -1,16 +1,13 @@
 """
-card_ingest.py — Build cards.db from a local Scryfall bulk card file (JSONL).
+card_ingest.py - Build cards.db from a local Scryfall bulk card file (JSONL).
 
 The card-side companion to ingest.py (which turns the rules .txt into
 rules.json/docs.json): this turns a Scryfall bulk *card* export into cards.db,
-the exact artifact build_card_cache.py produces from the live bulk download. Use
-it to seed or rebuild the card cache from a file you already downloaded — no
-network at all.
+the exact artifact build_card_cache.py produces from the live bulk download.
 
 Input: one JSON card object per line (JSONL), optionally gzip-compressed. Both
 the plain `.jsonl` and the `.jsonl.gz` work; the gz is streamed and decompressed
-on the fly, so you never need the (much larger) uncompressed copy on disk. Grab a
-bulk file from https://scryfall.com/docs/api/bulk-data.
+on the fly. Grab a bulk file from https://scryfall.com/docs/api/bulk-data.
 
     python card_ingest.py english-card-data.jsonl.gz
 

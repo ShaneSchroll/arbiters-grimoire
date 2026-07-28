@@ -1,8 +1,6 @@
 """
 admin.py - Command-line user management for the MTG Rules Oracle.
 
-Run on the same host the server runs on (so it touches the same users.db).
-
   python admin.py list
   python admin.py create  alice@example.com [--admin] [--approved]
   python admin.py approve alice@example.com
@@ -10,11 +8,13 @@ Run on the same host the server runs on (so it touches the same users.db).
   python admin.py make-admin alice@example.com
   python admin.py reset   alice@example.com [--base-url https://oracle.example.com]
   python admin.py delete  alice@example.com [--yes]
+  python admin.py credits alice@example.com 5 [--note "beta tester"]
+  python admin.py comp    alice@example.com on|off
 
-Bootstrap: the very first time you deploy, create an approved admin user with
-  python admin.py create you@example.com --admin --approved
-Then registrations from anyone else will land as un-approved until you run
-  python admin.py approve their@email.com
+Purchased credits are non-refundable and capped at auth.MAX_CREDIT_BALANCE_USD
+per account; `credits` is the owner override for both (grants bypass the cap,
+and a negative amount claws back, e.g. to mirror a chargeback settled in
+Stripe).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def cmd_list(_):
     if not users:
         print("(no users)")
         return
-    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'BUDGET/DAY':12} CREATED")
+    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'BUDGET/DAY':12} {'SUB':10} {'CREDITS':10} CREATED")
     for u in users:
         raw = u["daily_budget_micros"]
         if raw is None:
@@ -41,11 +41,15 @@ def cmd_list(_):
             budget = "unlimited"
         else:
             budget = f"${raw / 1_000_000:.2f}"
+        sub = u["subscription_status"] or "-"
+        balance = f"${auth.credit_balance_micros(u['id']) / 1_000_000:.2f}"
         print(
             f"{u['email']:36} "
             f"{'yes' if u['approved'] else 'no':5} "
             f"{'yes' if u['is_admin'] else 'no':6} "
             f"{budget:12} "
+            f"{sub:10} "
+            f"{balance:10} "
             f"{u['created_at']}"
         )
 
@@ -117,6 +121,9 @@ def _fmt_usd(micros: int) -> str:
 
 
 def cmd_budget(args):
+    """Override a user's daily spend limit, in credit dollars. Users set their
+    own on /account (seeded from their balance at first purchase); this is the
+    admin path, and the only one that can clear the limit or lift it entirely."""
     if args.unlimited:
         micros = -1
     elif args.default:
@@ -141,16 +148,40 @@ def cmd_budget(args):
 
 
 def cmd_usage(args):
+    """Today's spend against the daily limit. Both are CREDIT dollars (what
+    the user's balance drops by); `raw cost` is what we pay Anthropic."""
     s = auth.usage_summary_today(args.email)
     if s is None:
         sys.exit(f"No such user: {args.email}")
     print(f"{s['email']} - usage today (resets 00:00 UTC):")
-    print(f"  spent:     {_fmt_usd(s['spent_micros'])}")
+    print(f"  spent:     {_fmt_usd(s['spent_micros'])} of credits")
+    print(f"  raw cost:  {_fmt_usd(s['raw_micros'])}")
     if s["unlimited"]:
-        print("  budget:    unlimited")
+        print("  limit:     unlimited")
     else:
-        print(f"  budget:    {_fmt_usd(s['budget_micros'])}")
+        print(f"  limit:     {_fmt_usd(s['budget_micros'])}")
         print(f"  remaining: {_fmt_usd(s['remaining_micros'])}")
+
+
+def cmd_credits(args):
+    """Grant (or claw back, with a negative amount) prepaid usage credits."""
+    user = auth.get_user_by_email(args.email.lower())
+    if not user:
+        sys.exit(f"No such user: {args.email}")
+    if not auth.grant_credits(args.email, args.usd, args.note):
+        sys.exit(f"Failed to grant credits to {args.email}")
+    balance = auth.credit_balance_micros(user["id"])
+    verb = "Granted" if args.usd >= 0 else "Clawed back"
+    print(f"{verb} ${abs(args.usd):.2f}. {args.email} balance: {_fmt_usd(balance)}")
+
+
+def cmd_comp(args):
+    """Grant/revoke complimentary subscription status (passes the subscription
+    gate without Stripe; usage still deducts credits)."""
+    on = args.state == "on"
+    if not auth.set_comp(args.email, on):
+        sys.exit(f"No such user: {args.email}")
+    print(f"{args.email}: comp subscription {'granted' if on else 'revoked'}.")
 
 
 def main():
@@ -185,10 +216,10 @@ def main():
     sp.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     sp.set_defaults(func=cmd_delete)
 
-    sp = sub.add_parser("budget", help="Set a user's daily spend cap")
+    sp = sub.add_parser("budget", help="Set a user's daily spend limit")
     sp.add_argument("email")
     g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--usd", type=float, help="Daily cap in US dollars, e.g. 2.50")
+    g.add_argument("--usd", type=float, help="Daily limit in credit dollars, e.g. 2.50")
     g.add_argument("--unlimited", action="store_true", help="No daily cap")
     g.add_argument("--default", action="store_true", help="Use the global default")
     sp.set_defaults(func=cmd_budget)
@@ -196,6 +227,17 @@ def main():
     sp = sub.add_parser("usage", help="Show a user's spend so far today")
     sp.add_argument("email")
     sp.set_defaults(func=cmd_usage)
+
+    sp = sub.add_parser("credits", help="Grant prepaid usage credits (negative claws back)")
+    sp.add_argument("email")
+    sp.add_argument("usd", type=float, help="Dollar amount, e.g. 5 or -2.50")
+    sp.add_argument("--note", default=None, help="Optional ledger note")
+    sp.set_defaults(func=cmd_credits)
+
+    sp = sub.add_parser("comp", help="Grant/revoke complimentary subscription")
+    sp.add_argument("email")
+    sp.add_argument("state", choices=["on", "off"])
+    sp.set_defaults(func=cmd_comp)
 
     args = p.parse_args()
     args.func(args)

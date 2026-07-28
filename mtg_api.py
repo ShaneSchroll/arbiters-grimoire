@@ -1,8 +1,8 @@
 """
-mtg_api.py — Card lookups for the Rules Oracle and Deck Builder.
+mtg_api.py - Card lookups for the Rules Oracle and Deck Builder.
 
 Now cache-first: lookup_card consults the local CardCache (cards.db) and only
-touches the live Scryfall API on a miss — e.g. a card printed after the last
+touches the live Scryfall API on a miss - e.g. a card printed after the last
 bulk build. Misses are memoized so a given name hits the network at most once
 per process. This keeps the rules tool working for brand-new cards while
 respecting Scryfall's "don't crawl us" guidance for everything already cached.

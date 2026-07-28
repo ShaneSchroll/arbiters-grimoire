@@ -1,16 +1,16 @@
 """
-card_refresh.py — Runs the Scryfall bulk pull in the background for the admin
+card_refresh.py - Runs the Scryfall bulk pull in the background for the admin
 "Get Latest Cards" button.
 
 Why a background runner and not just calling build() in the request:
-  The oracle_cards download is >150MB and parsing ~30k cards takes a while —
-  far too long to hold an HTTP request open (proxies like Render would time it
+  The oracle_cards download is >150MB and parsing ~30k cards takes a while -
+  far too long to hold an HTTP request open (proxies like Render time it
   out). So the endpoint starts the job and returns immediately; the admin UI
   polls get_status() until it finishes.
 
 Why single-flight:
   A threading.Lock guarantees at most one build runs at a time. This is the
-  whole point of the button — clicking it twice, or two admins clicking at
+  whole point of the button - clicking it twice, or two admins clicking at
   once, must NOT fire two concurrent downloads at Scryfall. Extra clicks just
   return the in-progress status.
 """

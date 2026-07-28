@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerifyMismatchError
@@ -50,6 +51,12 @@ CHAT_MAX = 5
 CARD_WINDOW = timedelta(minutes=1)
 CARD_MAX = 30
 
+# Self-service password-reset links per user. Each call verifies the current
+# password and writes a token row, so this bounds both online guessing of that
+# password and unbounded token creation.
+PWLINK_WINDOW = timedelta(hours=1)
+PWLINK_MAX = 5
+
 # Trusted reverse proxies in front of the app, counted from the connection
 # inward: Render alone = 1; Cloudflare -> Render = 2. The env var MUST match
 # the real chain: too low and per-IP rate limits key on a proxy's (shared) IP;
@@ -57,6 +64,10 @@ CARD_MAX = 30
 TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
 
 # ---------- spend accounting ----------
+# Daily spend cap for an account that has never bought credits. Denominated in
+# CREDIT dollars (what the balance actually drops by), not raw Anthropic cost -
+# see usage_today_credit_micros. Buying credits replaces this with the user's
+# own limit, defaulting to their balance (ensure_daily_limit_default).
 DEFAULT_DAILY_BUDGET_MICROS = int(
     float(os.getenv("DAILY_BUDGET_USD", "1.00")) * 1_000_000
 )
@@ -72,6 +83,49 @@ _FALLBACK_RATE = {
     field: max(p[field] for p in PRICING.values())
     for field in ("input", "output", "cache_write", "cache_read")
 }
+
+# ---------- billing (subscription + prepaid credits) ----------
+# Master switch. When off (the default) the subscription/credits gate is not
+# enforced and usage does not deduct credits, so this code can be deployed,
+# Stripe configured, and credits granted/tested before anyone is locked out.
+# Flip BILLING_REQUIRED=1 only after the SETUP-BILLING.md checklist is done.
+BILLING_REQUIRED = os.getenv("BILLING_REQUIRED", "0").lower() in ("1", "true", "yes")
+
+# Multiplier applied to the raw Anthropic cost when deducting credits. Covers
+# Stripe's fee (2.9% + $0.30), the retrieval context the user never sees, and
+# margin. The usage_ledger keeps recording RAW cost; only the credit deduction
+# is marked up, so the markup can be tuned without rewriting history.
+CREDIT_MARKUP = float(os.getenv("CREDIT_MARKUP", "1.4"))
+
+# Hard ceiling on the credits one account may hold at once. Credits are
+# non-refundable, so this bounds what any single change of heart (or
+# chargeback) can be worth. Enforced at checkout - billing.py refuses a pack
+# that would overshoot - and surfaced as disabled pack buttons on /account.
+MAX_CREDIT_BALANCE_USD = float(os.getenv("MAX_CREDIT_BALANCE_USD", "20"))
+MAX_CREDIT_BALANCE_MICROS = int(MAX_CREDIT_BALANCE_USD * 1_000_000)
+
+# Bounds on the daily limit a user may choose for themselves. The floor keeps a
+# stray "0" from silently refusing every request; the ceiling is the most
+# credits they could hold anyway, so anything higher is the same as no limit.
+MIN_DAILY_LIMIT_MICROS = 250_000  # $0.25
+MAX_DAILY_LIMIT_MICROS = MAX_CREDIT_BALANCE_MICROS
+
+# Subscription statuses that count as "may use the app". 'active'/'trialing'
+# come from Stripe; 'comp' is a local, admin-granted status Stripe never sets
+# (complimentary access - e.g. the owner and testers).
+_SUB_OK_STATUSES = ("active", "trialing", "comp")
+
+# Grace window past the paid-through date, so a briefly-late renewal webhook
+# doesn't lock a paying user out the second their period ticks over. Applies
+# to PAID subscriptions only - a trial gets exactly its TRIAL_DAYS, and a
+# cancellation ends exactly when it says it does.
+SUB_GRACE = timedelta(days=3)
+
+# Every new account starts on a free trial of this length, granted at
+# registration. It opens the subscription half of the gate only - usage still
+# needs purchased credits - so nobody spends API dollars for free, and
+# cancelling before it runs out simply means never being charged.
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 
 PASSWORD_MIN_LEN = 12
 # Upper bound applied at the API boundary. Without one, uvicorn accepts
@@ -171,6 +225,7 @@ _login_ip = _RateLimiter(LOGIN_IP_MAX_FAILS, LOGIN_WINDOW)
 _register_limit = _RateLimiter(REGISTER_MAX, REGISTER_WINDOW)
 _chat_limit = _RateLimiter(CHAT_MAX, CHAT_WINDOW)
 _card_limit = _RateLimiter(CARD_MAX, CARD_WINDOW)
+_pwlink_limit = _RateLimiter(PWLINK_MAX, PWLINK_WINDOW)
 
 
 def chat_rate_limited(user_id: int) -> bool:
@@ -250,6 +305,17 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_usage_user_time
               ON usage_ledger(user_id, created_at);
+            CREATE TABLE IF NOT EXISTS credits_ledger (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              amount_micros INTEGER NOT NULL,  -- + purchase/grant, - usage
+              kind          TEXT    NOT NULL,  -- purchase | grant | usage
+              stripe_ref    TEXT    UNIQUE,    -- checkout session id; dedupes webhook retries
+              note          TEXT,
+              created_at    TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_credits_user
+              ON credits_ledger(user_id, created_at);
             CREATE TABLE IF NOT EXISTS conversations (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -278,14 +344,49 @@ def _migrate(db: sqlite3.Connection) -> None:
         # in which case the UI falls back to the email's local-part.
         db.execute("ALTER TABLE users ADD COLUMN name TEXT")
     if "daily_budget_micros" not in cols:
-        # Nullable: NULL means "use DEFAULT_DAILY_BUDGET_MICROS". A negative
-        # value means unlimited. A non-negative value is a per-user override.
+        # The daily spend limit, in credit dollars. Nullable: NULL means "use
+        # DEFAULT_DAILY_BUDGET_MICROS" and is the state of an account that has
+        # never bought credits. A negative value means unlimited (admin only).
+        # Anything else is the limit the user picked, or the balance snapshot
+        # ensure_daily_limit_default wrote at their first purchase.
         db.execute("ALTER TABLE users ADD COLUMN daily_budget_micros INTEGER")
     if "opus_allowed" not in cols:
         # Vestigial: per-user Opus gating was removed (every user can use every
         # model now). Retained so existing and fresh DBs share one schema;
         # nothing reads it anymore.
         db.execute("ALTER TABLE users ADD COLUMN opus_allowed INTEGER NOT NULL DEFAULT 0")
+    if "stripe_customer_id" not in cols:
+        # The Stripe Customer this user maps to. Created lazily on their first
+        # checkout; webhooks resolve users through it. Uniqueness is enforced
+        # by an index (ALTER ADD COLUMN can't carry a UNIQUE constraint).
+        db.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_stripe_customer "
+            "ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL"
+        )
+    if "subscription_status" not in cols:
+        # Mirror of the Stripe subscription status ('active', 'trialing',
+        # 'past_due', 'canceled', ...) or the local 'comp'. NULL = never
+        # subscribed. Kept current by webhooks + /api/billing/refresh.
+        db.execute("ALTER TABLE users ADD COLUMN subscription_status TEXT")
+    if "subscription_period_end" not in cols:
+        # ISO timestamp the subscription is paid through. The gate allows
+        # SUB_GRACE past it so a late renewal webhook doesn't lock users out.
+        db.execute("ALTER TABLE users ADD COLUMN subscription_period_end TEXT")
+    if "trial_ends_at" not in cols:
+        # End of the free trial granted at registration. NULL on accounts that
+        # predate trials - they simply never had one, and fall through to the
+        # normal subscription rules.
+        db.execute("ALTER TABLE users ADD COLUMN trial_ends_at TEXT")
+    if "canceled_at" not in cols:
+        # When the user asked to cancel. NULL = not cancelled. Set locally even
+        # when there is no Stripe subscription (e.g. cancelling a free trial).
+        db.execute("ALTER TABLE users ADD COLUMN canceled_at TEXT")
+    if "access_ends_at" not in cols:
+        # When a cancellation actually cuts access off: the end of whatever the
+        # user already has - the rest of the trial, or the period they've paid
+        # for. Credits are non-refundable, so access is never cut early.
+        db.execute("ALTER TABLE users ADD COLUMN access_ends_at TEXT")
 
 
 def _cleanup_expired() -> None:
@@ -339,6 +440,7 @@ def record_usage(
     cost = _cost_micros(
         model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
     )
+    now_iso = _now().isoformat()
     with _db() as db:
         db.execute(
             "INSERT INTO usage_ledger (user_id, model, input_tokens, output_tokens, "
@@ -346,9 +448,18 @@ def record_usage(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id, model, input_tokens, output_tokens,
-                cache_write_tokens, cache_read_tokens, cost, _now().isoformat(),
+                cache_write_tokens, cache_read_tokens, cost, now_iso,
             ),
         )
+        # Deduct prepaid credits at the marked-up rate. Only while billing is
+        # enforced, so pre-launch usage never drives balances negative before
+        # anyone has had a chance to buy credits.
+        if BILLING_REQUIRED and cost > 0:
+            db.execute(
+                "INSERT INTO credits_ledger (user_id, amount_micros, kind, note, "
+                "created_at) VALUES (?, ?, 'usage', ?, ?)",
+                (user_id, -int(round(cost * CREDIT_MARKUP)), model, now_iso),
+            )
     return cost
 
 
@@ -367,24 +478,38 @@ def usage_today_micros(user_id: int) -> int:
     return int(row["total"])
 
 
+def usage_today_credit_micros(user_id: int) -> int:
+    """Today's spend in CREDIT dollars: the raw cost marked up exactly the way
+    record_usage deducts it. The daily limit and every user-facing spend
+    readout are denominated this way so they line up with the balance the user
+    watches drop - a $5 limit means $5 off the balance, not $5 of raw cost
+    (which would be $7 of credits). Derived from the raw ledger rather than
+    summed from credits_ledger so the cap still works with BILLING_REQUIRED
+    off, when nothing is being deducted yet."""
+    return int(round(usage_today_micros(user_id) * CREDIT_MARKUP))
+
+
+def _budget_from_row(row) -> int:
+    """Daily limit (credit micro-dollars) from an already-loaded user row.
+    NULL -> the default; negative -> unlimited (a sentinel the callers treat as
+    no cap)."""
+    if row is None:
+        return DEFAULT_DAILY_BUDGET_MICROS
+    override = row["daily_budget_micros"]
+    return DEFAULT_DAILY_BUDGET_MICROS if override is None else int(override)
+
+
 def _budget_for(user_id: int) -> int:
-    """This user's daily budget in micro-dollars. NULL override -> the default;
-    a negative override -> unlimited (returned as a sentinel the caller treats
-    as no cap)."""
+    """This user's daily limit in credit micro-dollars."""
     with _db() as db:
         row = db.execute(
             "SELECT daily_budget_micros FROM users WHERE id = ?", (user_id,)
         ).fetchone()
-    if row is None:
-        return DEFAULT_DAILY_BUDGET_MICROS
-    override = row["daily_budget_micros"]
-    if override is None:
-        return DEFAULT_DAILY_BUDGET_MICROS
-    return int(override)
+    return _budget_from_row(row)
 
 
 def daily_budget_exceeded(user_id: int) -> bool:
-    """True if the user has already met or passed their daily budget. Checked
+    """True if the user has already met or passed their daily limit. Checked
     BEFORE a request starts; since token cost isn't known until generation
     finishes, the request that crosses the line is allowed to complete and the
     next one is refused. Per-request overshoot is bounded by max_tokens and the
@@ -392,12 +517,13 @@ def daily_budget_exceeded(user_id: int) -> bool:
     budget = _budget_for(user_id)
     if budget < 0:
         return False  # unlimited
-    return usage_today_micros(user_id) >= budget
+    return usage_today_credit_micros(user_id) >= budget
 
 
 def set_daily_budget(email: str, micros: Optional[int]) -> bool:
-    """Set a per-user daily budget override. None clears it (back to default);
-    a negative value means unlimited. Called by admin.py."""
+    """Set a per-user daily limit override by email. None clears it (back to
+    default); a negative value means unlimited. Called by admin.py, which is
+    the only path allowed to clear it or lift the cap entirely."""
     with _db() as db:
         cur = db.execute(
             "UPDATE users SET daily_budget_micros = ? WHERE email = ?",
@@ -406,20 +532,447 @@ def set_daily_budget(email: str, micros: Optional[int]) -> bool:
         return cur.rowcount > 0
 
 
+def set_user_daily_limit(user_id: int, micros: int) -> None:
+    """The self-service setter behind the account page. Always stores a
+    concrete number inside [MIN_DAILY_LIMIT_MICROS, MAX_DAILY_LIMIT_MICROS] -
+    users can't clear the limit or make it unlimited, only admins can."""
+    micros = max(MIN_DAILY_LIMIT_MICROS, min(int(micros), MAX_DAILY_LIMIT_MICROS))
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET daily_budget_micros = ? WHERE id = ?",
+            (micros, user_id),
+        )
+
+
+def ensure_daily_limit_default(user_id: int) -> None:
+    """Give a user their first daily limit the moment they first hold credits:
+    their whole balance, i.e. "I bought $10, I can spend $10 today".
+
+    Only ever fills a NULL, which is the point - topping up later must NOT
+    raise (or reset) a limit the user has since chosen, and an admin override
+    or an 'unlimited' setting is likewise left alone.
+    """
+    with _db() as db:
+        row = db.execute(
+            "SELECT daily_budget_micros FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None or row["daily_budget_micros"] is not None:
+            return
+        balance = int(db.execute(
+            "SELECT COALESCE(SUM(amount_micros), 0) AS total FROM credits_ledger "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()["total"])
+        if balance <= 0:
+            return
+        db.execute(
+            "UPDATE users SET daily_budget_micros = ? "
+            "WHERE id = ? AND daily_budget_micros IS NULL",
+            (max(MIN_DAILY_LIMIT_MICROS, min(balance, MAX_DAILY_LIMIT_MICROS)), user_id),
+        )
+
+
+def daily_limit_view(user_row) -> dict:
+    """The daily-limit block the account page renders and edits. All amounts
+    are credit dollars (see usage_today_credit_micros)."""
+    budget = _budget_from_row(user_row)
+    spent = usage_today_credit_micros(user_row["id"])
+    unlimited = budget < 0
+    return {
+        "usd": None if unlimited else round(budget / 1_000_000, 2),
+        "unlimited": unlimited,
+        # False while the user is still on the global default - the account
+        # page says "we'll set this for you when you buy credits" instead of
+        # presenting the number as a choice they made.
+        "is_custom": user_row["daily_budget_micros"] is not None,
+        "spent_today_usd": round(spent / 1_000_000, 2),
+        "remaining_usd": None if unlimited else round(
+            max(0, budget - spent) / 1_000_000, 2
+        ),
+        "min_usd": round(MIN_DAILY_LIMIT_MICROS / 1_000_000, 2),
+        "max_usd": round(MAX_DAILY_LIMIT_MICROS / 1_000_000, 2),
+    }
+
+
 def usage_summary_today(email: str) -> Optional[dict]:
-    """Per-user view of today's spend and remaining budget, for admin display."""
+    """Per-user view of today's spend and remaining limit, for admin display.
+    Reports both the raw cost (what we pay Anthropic) and the credit-dollar
+    figure the limit is measured in."""
     user = get_user_by_email(_normalize_email(email))
     if not user:
         return None
-    spent = usage_today_micros(user["id"])
-    budget = _budget_for(user["id"])
+    raw = usage_today_micros(user["id"])
+    spent = usage_today_credit_micros(user["id"])
+    budget = _budget_from_row(user)
     return {
         "email": user["email"],
+        "raw_micros": raw,
         "spent_micros": spent,
         "budget_micros": budget,
         "unlimited": budget < 0,
         "remaining_micros": None if budget < 0 else max(0, budget - spent),
     }
+
+
+# ---------- billing: prepaid credits + subscription state ----------
+
+def credit_balance_micros(user_id: int) -> int:
+    """The user's prepaid balance: every purchase/grant minus every marked-up
+    usage deduction. Can go slightly negative - output tokens aren't known
+    until a request finishes, so the request that empties the balance is
+    allowed to complete and the next one is refused (same shape as the daily
+    budget check)."""
+    with _db() as db:
+        row = db.execute(
+            "SELECT COALESCE(SUM(amount_micros), 0) AS total FROM credits_ledger "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return int(row["total"])
+
+
+def add_credits(
+    user_id: int,
+    amount_micros: int,
+    kind: str,
+    stripe_ref: Optional[str] = None,
+    note: Optional[str] = None,
+) -> bool:
+    """Append one credit row. When stripe_ref is set, the UNIQUE constraint
+    makes the insert idempotent - Stripe retries webhook deliveries and the
+    /api/billing/refresh self-heal re-lists past checkouts, so the same
+    purchase may be offered more than once. Returns True if a row was written
+    (False = duplicate stripe_ref, already credited)."""
+    with _db() as db:
+        cur = db.execute(
+            "INSERT OR IGNORE INTO credits_ledger "
+            "(user_id, amount_micros, kind, stripe_ref, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, amount_micros, kind, stripe_ref, note, _now().isoformat()),
+        )
+        written = cur.rowcount > 0
+    # First money in gets a daily limit to match. Deliberately after the insert
+    # so the balance it snapshots includes this credit, and skipped for a
+    # duplicate so a webhook retry can't move a limit the user has since set.
+    if written and amount_micros > 0 and kind in ("purchase", "grant"):
+        ensure_daily_limit_default(user_id)
+    return written
+
+
+def credit_headroom_micros(user_id: int) -> int:
+    """How much more this user may buy before hitting MAX_CREDIT_BALANCE. A
+    balance run negative by a final overshooting request doesn't earn extra
+    headroom, hence the clamp at the cap."""
+    return max(0, min(
+        MAX_CREDIT_BALANCE_MICROS,
+        MAX_CREDIT_BALANCE_MICROS - credit_balance_micros(user_id),
+    ))
+
+
+def pack_affordable(user_id: int, cents: int) -> bool:
+    """True if buying this pack would leave the balance at or under the cap."""
+    return cents * 10_000 <= credit_headroom_micros(user_id)
+
+
+def grant_credits(email: str, usd: float, note: Optional[str] = None) -> bool:
+    """Admin: grant (or claw back, with a negative amount) credits by email."""
+    user = get_user_by_email(_normalize_email(email))
+    if not user:
+        return False
+    return add_credits(
+        user["id"], int(round(usd * 1_000_000)), "grant", note=note or "admin grant"
+    )
+
+
+def credit_history(user_id: int, limit: int = 10) -> list[dict]:
+    """Most recent credit-ledger rows for the account page."""
+    with _db() as db:
+        rows = db.execute(
+            "SELECT amount_micros, kind, note, created_at FROM credits_ledger "
+            "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {
+            "amount_usd": round(r["amount_micros"] / 1_000_000, 4),
+            "kind": r["kind"],
+            "note": r["note"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+def set_stripe_customer(user_id: int, customer_id: str) -> None:
+    """Record the Stripe Customer for a user, first writer wins (a concurrent
+    checkout could race to create two customers; keeping the first stored id
+    consistent matters more than which one wins)."""
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET stripe_customer_id = ? "
+            "WHERE id = ? AND stripe_customer_id IS NULL",
+            (customer_id, user_id),
+        )
+
+
+def get_user_by_stripe_customer(customer_id: str) -> Optional[sqlite3.Row]:
+    if not customer_id:
+        return None
+    with _db() as db:
+        return db.execute(
+            "SELECT * FROM users WHERE stripe_customer_id = ?", (customer_id,)
+        ).fetchone()
+
+
+def set_subscription(
+    user_id: int, status: Optional[str], period_end_iso: Optional[str]
+) -> None:
+    """Mirror Stripe subscription state onto the user row (called from webhook
+    handlers and the refresh self-heal). Never lets a Stripe event downgrade a
+    'comp' user: comp is admin-granted, so e.g. cancelling an old paid
+    subscription must not revoke complimentary access."""
+    with _db() as db:
+        row = db.execute(
+            "SELECT subscription_status FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return
+        if row["subscription_status"] == "comp" and status not in ("active", "trialing"):
+            return
+        db.execute(
+            "UPDATE users SET subscription_status = ?, subscription_period_end = ? "
+            "WHERE id = ?",
+            (status, period_end_iso, user_id),
+        )
+
+
+def set_comp(email: str, comp: bool) -> bool:
+    """Admin: grant or revoke complimentary subscription access. Granting also
+    clears any cancellation (comp is an override, so it shouldn't leave the
+    user locked out by an earlier cancel). Revoking clears the status entirely;
+    if the user also has a real Stripe subscription, the next webhook or
+    refresh restores it."""
+    with _db() as db:
+        if comp:
+            cur = db.execute(
+                "UPDATE users SET subscription_status = 'comp', "
+                "subscription_period_end = NULL, canceled_at = NULL, "
+                "access_ends_at = NULL WHERE email = ?",
+                (_normalize_email(email),),
+            )
+        else:
+            cur = db.execute(
+                "UPDATE users SET subscription_status = NULL, "
+                "subscription_period_end = NULL WHERE email = ?",
+                (_normalize_email(email),),
+            )
+        return cur.rowcount > 0
+
+
+def _parse_ts(iso: Optional[str]) -> Optional[datetime]:
+    """Parse a stored ISO timestamp into an aware UTC datetime, or None if it
+    is missing/unparseable. Naive values are assumed UTC (everything we write
+    goes through _now(), which is aware, but hand-edited rows happen)."""
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+def in_trial(user_row) -> bool:
+    """True while the user is inside their signup trial - the window in which
+    cancelling means never being charged for a subscription."""
+    end = _parse_ts(user_row["trial_ends_at"])
+    return end is not None and _now() <= end
+
+
+def is_canceled(user_row) -> bool:
+    """True once the user has asked to cancel, whether or not access has
+    actually lapsed yet (post-trial cancellations keep access until the paid
+    period runs out)."""
+    return bool(user_row["canceled_at"])
+
+
+def subscription_ok(user_row) -> bool:
+    """True when this user's subscription entitles them to use the app now.
+
+    Order matters: comp overrides everything; a cancellation then decides on
+    its own recorded end time (exactly, with no grace - the user keeps what
+    they already have and not a day more). Otherwise active/trialing hold
+    until the period ends, with SUB_GRACE extended only to paid subscriptions
+    so a late renewal webhook can't lock out a paying customer.
+    """
+    status = user_row["subscription_status"]
+    if status == "comp":
+        return True
+    if is_canceled(user_row):
+        end = _parse_ts(user_row["access_ends_at"])
+        return end is not None and _now() <= end
+    if status not in _SUB_OK_STATUSES:
+        return False
+    end = _parse_ts(user_row["subscription_period_end"])
+    if end is None:
+        return True
+    if status == "trialing":
+        return _now() <= end
+    return _now() <= end + SUB_GRACE
+
+
+def purchase_blocked(user_row) -> Optional[dict]:
+    """Why this user may not buy more credits, or None if they may.
+
+    The balance cap is checked first because it applies to everyone, comped
+    accounts included - it's about how much money we're willing to take, not
+    about entitlement. Past that, buying requires a subscription that is
+    currently good AND not cancelled, so the default for an account with no
+    live subscription is 'blocked', and someone winding down can't stock up on
+    fuel they won't be able to burn.
+    """
+    if credit_balance_micros(user_row["id"]) >= MAX_CREDIT_BALANCE_MICROS:
+        return {
+            "code": "credit_limit_reached",
+            "message": f"You already have the maximum ${MAX_CREDIT_BALANCE_USD:.0f} "
+                       f"in credits. You can buy more once you've used some.",
+        }
+    if user_row["subscription_status"] == "comp":
+        return None
+    if is_canceled(user_row):
+        return {
+            "code": "subscription_canceled",
+            "message": "Your subscription is cancelled — resume it to buy credits.",
+        }
+    if not subscription_ok(user_row):
+        return {
+            "code": "subscription_required",
+            "message": "An active subscription is required to buy credits.",
+        }
+    return None
+
+
+def can_purchase_credits(user_row) -> bool:
+    return purchase_blocked(user_row) is None
+
+
+def cancel_subscription(user_id: int) -> Optional[dict]:
+    """Record a cancellation. Access always runs to the end of whatever the
+    user already has - the rest of the trial, or the period they've paid for -
+    because credits are non-refundable and cutting access early would strand a
+    balance they can no longer spend. Returns a description of what happened,
+    or None if the user doesn't exist / was already cancelled."""
+    user = get_user_by_id(user_id)
+    if user is None or is_canceled(user):
+        return None
+    now = _now()
+    access_end = entitlement_end(user) or now
+    if access_end < now:
+        access_end = now
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET canceled_at = ?, access_ends_at = ? WHERE id = ?",
+            (now.isoformat(), access_end.isoformat(), user_id),
+        )
+    return {
+        "in_trial": in_trial(user),
+        "access_ends_at": access_end.isoformat(),
+    }
+
+
+def clear_cancellation(user_id: int) -> None:
+    """Unconditionally drop the cancel state. Used when a brand-new
+    subscription starts, where resume_subscription's "hasn't lapsed yet" guard
+    would otherwise leave a stale cancellation pinning access shut."""
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET canceled_at = NULL, access_ends_at = NULL WHERE id = ?",
+            (user_id,),
+        )
+
+
+def end_access_now(user_id: int) -> None:
+    """Cut access off immediately (Stripe deleted the subscription outright).
+    An existing canceled_at is preserved so a cancellation the user already
+    made keeps its original timestamp."""
+    now = _now().isoformat()
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET canceled_at = COALESCE(canceled_at, ?), "
+            "access_ends_at = ? WHERE id = ?",
+            (now, now, user_id),
+        )
+
+
+def entitlement_end(user_row) -> Optional[datetime]:
+    """The last moment this user is entitled to access, ignoring any
+    cancellation: the later of the trial end and the paid-through date. This
+    is what a cancellation freezes access_ends_at to, and what can_resume()
+    measures against - a Stripe-side deletion can still pull access_ends_at
+    forward (end_access_now), so the two aren't always the same value."""
+    ends = [
+        ts for ts in (
+            _parse_ts(user_row["trial_ends_at"]),
+            _parse_ts(user_row["subscription_period_end"]),
+        ) if ts is not None
+    ]
+    return max(ends) if ends else None
+
+
+def can_resume(user_row) -> bool:
+    """True when a cancellation can still be undone, so the UI knows to offer
+    Resume rather than a fresh Subscribe."""
+    if not is_canceled(user_row):
+        return False
+    end = entitlement_end(user_row)
+    return end is None or _now() <= end
+
+
+def resume_subscription(user_id: int) -> bool:
+    """Undo a cancellation, restoring access and the ability to buy credits.
+    Allowed for as long as the user still has time left on the trial or paid
+    period they cancelled - including right after an in-trial cancellation,
+    which is exactly when someone is most likely to change their mind.
+    Returns False when there is nothing left to resume; that needs a fresh
+    subscription."""
+    user = get_user_by_id(user_id)
+    if user is None or not can_resume(user):
+        return False
+    clear_cancellation(user_id)
+    return True
+
+
+def billing_blocked(user_row) -> Optional[dict]:
+    """Why this user may not spend API dollars right now, or None if they may.
+    The failure codes drive distinct UI on the account page."""
+    if not BILLING_REQUIRED:
+        return None
+    if not subscription_ok(user_row):
+        if is_canceled(user_row):
+            return {
+                "code": "subscription_canceled",
+                "message": "Your subscription is cancelled and access has ended. "
+                           "Subscribe again to keep using the Arbiter.",
+            }
+        return {
+            "code": "subscription_required",
+            "message": "An active subscription is required to use the Arbiter.",
+        }
+    if credit_balance_micros(user_row["id"]) <= 0:
+        return {
+            "code": "credits_required",
+            "message": "You're out of usage credits.",
+        }
+    return None
+
+
+def require_billing(user_row) -> None:
+    """Gate for the endpoints that spend API dollars (/api/chat,
+    /api/deckbuilder). 402 with a structured detail the frontends turn into a
+    'visit your Account page' notice. No-op until BILLING_REQUIRED is set."""
+    blocked = billing_blocked(user_row)
+    if blocked:
+        raise HTTPException(status_code=402, detail=blocked)
 
 
 # ---------- user / password ops ----------
@@ -437,12 +990,21 @@ def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
 def _insert_user(email: str, pw_hash: str, name: Optional[str] = None) -> int:
     """Insert a pre-normalized email and pre-computed hash. Caller owns hashing
     so register() can hash unconditionally (constant timing) without this
-    function hashing a second time."""
+    function hashing a second time.
+
+    Every new account starts on a TRIAL_DAYS free trial. The trial only opens
+    the subscription half of the gate - usage still needs purchased credits -
+    so it is a "try it for a week, pay only for what you use" window rather
+    than free API spend.
+    """
+    now = _now()
+    trial_end = (now + timedelta(days=TRIAL_DAYS)).isoformat()
     with _db() as db:
         cur = db.execute(
-            "INSERT INTO users (email, password_hash, name, approved, is_admin, created_at) "
-            "VALUES (?, ?, ?, 0, 0, ?)",
-            (email, pw_hash, name, _now().isoformat()),
+            "INSERT INTO users (email, password_hash, name, approved, is_admin, "
+            "subscription_status, subscription_period_end, trial_ends_at, created_at) "
+            "VALUES (?, ?, ?, 0, 0, 'trialing', ?, ?, ?)",
+            (email, pw_hash, name, trial_end, trial_end, now.isoformat()),
         )
         return cur.lastrowid
 
@@ -460,6 +1022,15 @@ def verify_password(stored_hash: str, password: str) -> bool:
         return True
     except (VerifyMismatchError, InvalidHash):
         return False
+
+
+def update_name(user_id: int, name: Optional[str]) -> None:
+    """Set or clear the optional display name. NULL means "unset", in which
+    case the UI falls back to the email's local-part."""
+    with _db() as db:
+        db.execute(
+            "UPDATE users SET name = ? WHERE id = ?", (_clean_name(name), user_id)
+        )
 
 
 def update_password(user_id: int, new_password: str) -> None:
@@ -533,11 +1104,10 @@ def consume_reset_token(token: str) -> Optional[int]:
 # ---------- admin ops (called by admin.py) ----------
 
 def list_users() -> list[sqlite3.Row]:
+    # SELECT * so callers can pass rows straight to subscription_ok() /
+    # daily_limit_view(), which read the trial, cancellation and limit columns.
     with _db() as db:
-        return db.execute(
-            "SELECT id, email, approved, is_admin, "
-            "daily_budget_micros, created_at FROM users ORDER BY created_at"
-        ).fetchall()
+        return db.execute("SELECT * FROM users ORDER BY created_at").fetchall()
 
 
 def count_admins() -> int:
@@ -600,6 +1170,17 @@ class ResetReq(BaseModel):
     new_password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
 
 
+class NameReq(BaseModel):
+    # Bounded generously here; _clean_name trims to MAX_NAME_LEN and turns a
+    # blank value into NULL (display falls back to the email's local-part).
+    name: Optional[str] = Field(default=None, max_length=200)
+
+
+class PasswordLinkReq(BaseModel):
+    # The caller's CURRENT password, re-entered to authorize a reset link.
+    password: str = Field(max_length=PASSWORD_MAX_LEN)
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort real client IP, resistant to X-Forwarded-For spoofing.
 
@@ -626,6 +1207,17 @@ def _is_secure(request: Request) -> bool:
     if request.url.scheme == "https":
         return True
     return request.headers.get("x-forwarded-proto", "").lower() == "https"
+
+
+def base_url(request: Request) -> str:
+    """Absolute origin for links and redirects we hand to users (reset links,
+    Stripe checkout returns). APP_BASE_URL wins when set; otherwise it is
+    derived from the incoming request so links are correct with no config."""
+    base = os.getenv("APP_BASE_URL", "").rstrip("/")
+    if base:
+        return base
+    scheme = "https" if _is_secure(request) else request.url.scheme
+    return f"{scheme}://{request.headers.get('host', '')}"
 
 
 def _set_session_cookie(
@@ -773,8 +1365,11 @@ def logout(request: Request, response: Response):
 
 @router.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    spent = usage_today_micros(user["id"])
-    budget = _budget_for(user["id"])
+    # Spend is reported in credit dollars, the same units as the daily limit
+    # and the balance, so the header's "$0.40 / $5.00 today" reads against the
+    # number the user actually watches drop rather than raw Anthropic cost.
+    spent = usage_today_credit_micros(user["id"])
+    budget = _budget_from_row(user)
     unlimited = budget < 0
     return {
         "email": user["email"],
@@ -785,6 +1380,51 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "unlimited": unlimited,
         "spent_usd": round(spent / 1_000_000, 4),
         "budget_usd": None if unlimited else round(budget / 1_000_000, 2),
+        # Billing state for the header + account page. Additive - existing
+        # consumers of the fields above are unaffected.
+        "billing_required": BILLING_REQUIRED,
+        "subscription_status": user["subscription_status"],
+        "subscription_ok": subscription_ok(user),
+        "in_trial": in_trial(user),
+        "canceled": is_canceled(user),
+        "credit_balance_usd": round(credit_balance_micros(user["id"]) / 1_000_000, 2),
+    }
+
+
+@router.post("/name")
+def set_display_name(
+    req: NameReq, request: Request, user: sqlite3.Row = Depends(require_user)
+):
+    """Set or clear the sidebar display name. The email is deliberately NOT
+    editable: it is the account's identity for sign-in, reset links, and the
+    Stripe customer, so changing it here would silently split those."""
+    require_same_origin(request)
+    update_name(user["id"], req.name)
+    return {"ok": True, "name": _clean_name(req.name)}
+
+
+@router.post("/password-reset-link")
+def self_service_reset_link(
+    req: PasswordLinkReq, request: Request, user: sqlite3.Row = Depends(require_user)
+):
+    """Issue a single-use reset link for the caller's own account - the
+    self-service equivalent of `python admin.py reset <email>`, reusing the
+    same token table and /reset page.
+
+    The current password is required: a session cookie alone must not be able
+    to change the password, or an unattended browser (or a stolen cookie)
+    could lock the real owner out. Spending the link invalidates every
+    session, so the user signs in again with the new password.
+    """
+    require_same_origin(request)
+    if _pwlink_limit.hit(str(user["id"])):
+        raise HTTPException(429, "Too many attempts. Please wait and try again.")
+    if not verify_password(user["password_hash"], req.password):
+        raise HTTPException(403, "That password is incorrect.")
+    token = create_reset_token(user["id"])
+    return {
+        "reset_url": f"{base_url(request)}/reset?token={quote(token)}",
+        "expires_hours": int(RESET_TOKEN_TTL.total_seconds() // 3600),
     }
 
 

@@ -1,9 +1,9 @@
 # MTG Arbiters Grimoire
 
 A web-based chat assistant that answers Magic: The Gathering rules questions,
-grounded in the official rulebook PDF and backed by Claude. It retrieves the
+grounded in the official rulebook and backed by Claude. It retrieves the
 relevant rules for every question, cites rule numbers, and can look up live
-card text from Scryfall when a question names a specific card.
+card oracle text from Scryfall when a question names a specific card.
 
 ## What's inside
 
@@ -16,7 +16,7 @@ card text from Scryfall when a question names a specific card.
 | `auth.py`           | SQLite-backed login, sessions, and approval gate.           |
 | `admin.py`          | CLI for approving users and minting password-reset links.   |
 | `src/`              | Astro frontend source: pages, layouts, components, scripts, styles. |
-| `dist/`             | Astro build output (`npm run build`) — the HTML/JS/CSS the server actually serves. |
+| `dist/`             | Astro build output - the HTML/JS/CSS the server actually serves. |
 
 ## Setup
 
@@ -33,14 +33,14 @@ python ingest.py rules.txt
 # 3a. Build the cards index from the official Scryfall English bulk cards (gzipped for space)
 python card_ingest.py english-card-data.jsonl.gz
 
-# 3b. On the live server run with --out since the CLI doesn't call load_dotenv
+# 3b. Run with --out since the CLI doesn't call load_dotenv
 python card_ingest.py english-card-data.jsonl.gz --out /var/data/cards.db
 
 # 4. Build the frontend (Node 22.12+). Re-run after editing anything in src/.
 npm install
 npm run build
 
-# 5. Start the app — it serves the built site out of dist/
+# 5. Start the app - it serves the built site out of dist/
 uvicorn server:app --port 8000
 ```
 
@@ -48,25 +48,8 @@ uvicorn server:app --port 8000
 
 The UI lives in `src/` and is built with Astro into `dist/`. The Python server
 serves the built files directly: each page comes from `dist/<route>/index.html`,
-hashed JS/CSS from `dist/_astro/`, and favicons from the `dist/` root. URLs are
-unchanged from before the migration — `server.py` maps each route to its built
-file.
+hashed JS/CSS from `dist/_astro/`, and favicons from the `dist/` root.
 
-- **Iterating on the frontend (fast loop):** start the Python server once
-  (`uvicorn server:app --port 8000`), then in a second terminal run `npm run dev`.
-  Astro serves `src/` with hot reload on http://localhost:4321 and proxies
-  `/api/*` and `/docs.json` through to uvicorn (see `astro.config.mjs`), so
-  `.astro`/JS/CSS edits appear instantly — no rebuild, no Python restart. Caveat:
-  the dev server uses Astro's file routes (`/auth/login`, `/tips`, `/rules`), not
-  the Python server's pretty routes (`/login`, `/pages/tips`, `/pages/rules`), so
-  sign in at `/auth/login` first to get a session cookie on :4321.
-- **Iterating on the frontend (production parity):** edit files under `src/`,
-  run `npm run build`, and reload the Python app to serve the real built URLs.
-- **Deploying to Render:** `dist/` is committed to the repo, so Render's default
-  Python build (`pip install -r requirements.txt`) is all that's needed — no
-  Node step at deploy time. **Re-run `npm run build` and commit `dist/` whenever
-  you change `src/`,** or the deployed site will be stale. Start command:
-  `uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips '*'`
 ## Commands to work with users
 
 ```bash
@@ -93,7 +76,7 @@ automatically falls back to fixed-size chunks.
 ## How it works
 
 For each question the backend
-    1. Retrieves the 6 most relevant rulebook chunks
+    1. Retrieves the most relevant rulebook chunks
     2. Sends them to Claude with a judge-level system prompt
     3. Lets Claude call the Scryfall tool if a card is named
-    4. returns the answer plus the rule sources, shown as chips under each reply
+    4. Returns the answer plus the rule sources, shown as chips under each reply

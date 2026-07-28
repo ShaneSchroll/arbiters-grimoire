@@ -1,10 +1,10 @@
 """
-build_card_cache.py — Download Scryfall's `oracle_cards` bulk file once and
+build_card_cache.py - Download Scryfall's `oracle_cards` bulk file once and
 build a local SQLite card cache for instant, offline lookups.
 
-This is the cards-side analogue of ingest.py: a one-shot build step that
+This is the cards-side analogue of ingest.py: a build step that
 produces an artifact (cards.db) the running server loads read-only via
-card_cache.CardCache — exactly how Retriever loads rules.json.
+card_cache.CardCache - exactly how Retriever loads rules.json.
 
 Why bulk data instead of looping the API:
   Scryfall explicitly asks you NOT to fetch cards one-by-one for catalog-scale
@@ -16,10 +16,6 @@ Usage:
     python build_card_cache.py                 # build ./cards.db
     python build_card_cache.py --out cards.db  # custom path
     python build_card_cache.py --force         # rebuild even if fresh
-
-Run it in your deploy/build step (next to `python ingest.py rules.txt`), or behind
-the admin panel / a cron job. No new dependencies: httpx is already in your
-requirements, sqlite3 ships with Python.
 """
 
 from __future__ import annotations
@@ -41,8 +37,7 @@ BULK_TYPE = "oracle_cards"  # one row per gameplay-unique card
 USER_AGENT = "mtg-rules-assistant/1.0"
 ACCEPT = "application/json;q=0.9,*/*;q=0.8"  # Scryfall asks clients to send Accept
 # cards.db location. Configurable like AUTH_DB_PATH so it can live on a
-# persistent disk (e.g. CARD_DB_PATH=/var/data/cards.db) rather than the
-# ephemeral code directory; defaults next to this script for local dev.
+# persistent disk rather than the phemeral code directory; defaults next to this script for local dev.
 DEFAULT_OUT = Path(os.getenv("CARD_DB_PATH") or Path(__file__).resolve().parent / "cards.db")
 
 # Layouts with no rules text worth ruling on — skipped so they don't pollute
