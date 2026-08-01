@@ -30,11 +30,13 @@ pip install -r requirements.txt
 #    Download it from https://magic.wizards.com/en/rules as rules.txt
 python ingest.py rules.txt
 
-# 3a. Build the cards index from the official Scryfall English bulk cards (gzipped for space)
-python card_ingest.py english-card-data.jsonl.gz
+# 3a. Build the cards index from Scryfall's Oracle Cards bulk export (gzipped)
+#     https://scryfall.com/docs/api/bulk-data — same data build_card_cache.py pulls live
+python card_ingest.py oracle-card-data.jsonl.gz
 
-# 3b. On the live server run with --out since the CLI doesn't call load_dotenv
-python card_ingest.py english-card-data.jsonl.gz --out /var/data/cards.db
+# 3b. Locally, pass --out if CARD_DB_PATH lives only in .env (the CLI doesn't
+#     call load_dotenv). On Render it's a real env var, so --out isn't needed.
+python card_ingest.py oracle-card-data.jsonl.gz --out /var/data/cards.db
 
 # 4. Build the frontend (Node 22.12+). Re-run after editing anything in src/.
 npm install

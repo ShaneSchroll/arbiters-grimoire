@@ -12,7 +12,14 @@ the plain `.jsonl` and the `.jsonl.gz` work; the gz is streamed and decompressed
 on the fly, so you never need the (much larger) uncompressed copy on disk. Grab a
 bulk file from https://scryfall.com/docs/api/bulk-data.
 
-    python card_ingest.py english-card-data.jsonl.gz
+Prefer the **Oracle Cards** export (~23MB gzipped). It is one row per
+gameplay-unique card, which is exactly what this cache stores and exactly what
+build_card_cache.py downloads — so both paths yield the same card set. The
+broader Default/All Cards exports work too, but they are several times the size
+and carry extra printings whose name is the doubled `X // X` form, which dedup
+keeps as separate rows.
+
+    python card_ingest.py oracle-card-data.jsonl.gz
 
 Projection, dedup (one row per gameplay-unique card, by oracle_id) and the
 on-disk schema are all shared with build_card_cache.py, so a cache built here is
@@ -27,9 +34,6 @@ never called on the request hot path.
 from __future__ import annotations
 
 import argparse
-import gzip
-import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -37,29 +41,6 @@ from pathlib import Path
 import build_card_cache as bcc
 
 DEFAULT_OUT = bcc.DEFAULT_OUT
-
-
-def _open_stream(path: Path):
-    """Open `path` for line iteration, transparently handling gzip.
-
-    Returns (line_iter, tell, total, raw) where tell()/total are the *compressed*
-    byte position/size for a .gz — so progress tracks the file you actually read
-    off disk — and plain byte position/size otherwise. `raw` is the underlying
-    file to close."""
-    raw = open(path, "rb")
-    total = os.fstat(raw.fileno()).st_size or 1
-    magic = raw.read(2)
-    raw.seek(0)
-    stream = gzip.GzipFile(fileobj=raw) if magic == b"\x1f\x8b" else raw
-    return stream, raw.tell, total, raw
-
-
-def _records(stream):
-    """Yield one card dict per non-blank JSONL line."""
-    for line in stream:
-        line = line.strip()
-        if line:
-            yield json.loads(line)
 
 
 def _progress(phase: str, done: int, total: int) -> None:
@@ -71,24 +52,19 @@ def _progress(phase: str, done: int, total: int) -> None:
 
 def build_from_file(src: Path, out: Path) -> int:
     """Build `out` (cards.db) from the local bulk file `src`. Returns card count."""
-    stream, tell, total, raw = _open_stream(src)
-    try:
-        # Version the cache by the source file's mtime, prefixed so it never
-        # collides with Scryfall's bulk `updated_at` stamp — a later live refresh
-        # will always see a different version and can rebuild over this one.
-        updated_at = "local-" + time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(src.stat().st_mtime)
-        )
+    # Version the cache by the source file's mtime, prefixed so it never
+    # collides with Scryfall's bulk `updated_at` stamp — a later live refresh
+    # will always see a different version and can rebuild over this one.
+    updated_at = "local-" + time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(src.stat().st_mtime)
+    )
+    # bcc.bulk_stream reads gzipped-or-plain JSONL and is the same reader the
+    # live download uses, so both paths produce an identical cache.
+    with bcc.bulk_stream(src) as (records, tell, total):
         count = bcc.write_db(
-            out, _records(stream), updated_at,
+            out, records, updated_at,
             progress=_progress, tell=tell, total=total,
         )
-    finally:
-        try:
-            stream.close()
-        finally:
-            if raw is not stream:
-                raw.close()
     print()  # terminate the progress line
     return count
 

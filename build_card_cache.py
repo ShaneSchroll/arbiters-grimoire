@@ -18,28 +18,29 @@ Usage:
     python build_card_cache.py --force         # rebuild even if fresh
 
 This is the whole card refresh, and it runs from a shell — never from the web
-process. It downloads >150MB and parses ~30k cards, which is minutes of work
-with no HTTP request that could sensibly wait on it, and keeping it out here is
-what lets the app run more than one uvicorn worker. Restart the server
+process. It downloads ~23MB gzipped and parses ~30k cards, which is minutes of
+work with no HTTP request that could sensibly wait on it, and keeping it out
+here is what lets the app run more than one uvicorn worker. Restart the server
 afterwards: it holds cards.db open, so it keeps serving the old file until it
 does. Run it in your deploy/build step (next to `python ingest.py rules.txt`) or
-by hand when a set drops. No new dependencies: httpx is already in your
-requirements, sqlite3 ships with Python.
+by hand when a set drops. No dependencies beyond httpx, which is already in your
+requirements; gzip and sqlite3 ship with Python.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import sqlite3
 import sys
 import time
 import unicodedata
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
-import ijson  # streaming JSON parser — keeps memory flat on small instances
 
 SCRYFALL = "https://api.scryfall.com"
 BULK_TYPE = "oracle_cards"  # one row per gameplay-unique card
@@ -102,19 +103,73 @@ def project(card: dict) -> dict:
 
 def fetch_bulk_download_uri(client: httpx.Client) -> tuple[str, str, int]:
     """Resolve the current oracle_cards download URL, its updated_at stamp, and
-    the file size in bytes.
+    the download size in bytes.
 
     The download URL's filename changes daily, so we always ask the API for the
     latest one rather than hardcoding it. This is a single lightweight request.
-    `size` is the uncompressed byte size of the file, which is what we write to
-    disk — so it's an accurate denominator for download progress."""
+    The size returned is of the file as it comes off the wire, which is what we
+    stream to disk — so it's an accurate denominator for download progress.
+
+    Scryfall renamed both fields: `download_uri` (a ~150MB uncompressed JSON
+    array) became `jsonl_download_uri` (gzipped JSON Lines, ~23MB), and `size`
+    became `compressed_size`. We read the new names and fall back to the old
+    ones, so this keeps working whichever they serve.
+    """
     r = client.get(f"{SCRYFALL}/bulk-data/{BULK_TYPE}", timeout=30)
     r.raise_for_status()
     meta = r.json()
-    return meta["download_uri"], meta.get("updated_at", ""), int(meta.get("size", 0))
+    uri = meta.get("jsonl_download_uri") or meta.get("download_uri")
+    if not uri:
+        # A bare KeyError here just names a dict key, which sends you looking in
+        # the wrong place. The response was a 200, so the API shape moved again.
+        raise RuntimeError(
+            f"Scryfall's {BULK_TYPE} response carried no download URL. It "
+            f"returned keys {sorted(meta)} — the bulk-data API shape has "
+            "changed, so fetch_bulk_download_uri needs updating."
+        )
+    size = int(meta.get("compressed_size") or meta.get("size") or 0)
+    return uri, meta.get("updated_at", ""), size
 
 
 ProgressFn = "Callable[[str, int, int], None] | None"
+
+
+def _records(stream):
+    """Yield one card dict per non-blank JSONL line."""
+    for line in stream:
+        line = line.strip()
+        if line:
+            yield json.loads(line)
+
+
+@contextmanager
+def bulk_stream(path: Path):
+    """Open a Scryfall bulk file for streaming, transparently handling gzip.
+
+    Yields ``(records, tell, total)``: an iterator of card dicts, a callable
+    returning bytes consumed, and the file's size. Both counters measure the
+    *compressed* file, so progress tracks the bytes actually read off disk
+    rather than the much larger expansion.
+
+    Shared by both build paths — the live download here and card_ingest.py's
+    local file — so a cache is identical whichever produced it. Reading line by
+    line is what keeps memory flat: holding the whole file as a string plus the
+    full ~30k-object graph blows past a 512MB instance and gets the process
+    OOM-killed (SIGKILL, which no except-handler ever sees).
+    """
+    raw = open(path, "rb")
+    try:
+        total = os.fstat(raw.fileno()).st_size or 1
+        is_gz = raw.read(2) == b"\x1f\x8b"
+        raw.seek(0)
+        stream = gzip.GzipFile(fileobj=raw) if is_gz else raw
+        try:
+            yield _records(stream), raw.tell, total
+        finally:
+            if stream is not raw:
+                stream.close()
+    finally:
+        raw.close()
 
 
 def build(out: Path, force: bool = False, progress=None) -> int | None:
@@ -142,9 +197,10 @@ def build(out: Path, force: bool = False, progress=None) -> int | None:
             return None
 
         print(f"[build] downloading {download_uri}")
-        # The file is large (>150MB raw). Stream it straight to disk instead of
-        # holding it all in memory, then parse from the temp file.
-        tmp = out.with_suffix(".download.json")
+        # Stream straight to disk rather than holding the payload in memory,
+        # then parse from the temp file. It arrives gzipped (~23MB) and expands
+        # to a few hundred MB, so it is never fully decompressed anywhere.
+        tmp = out.with_suffix(".download.jsonl.gz")
         got = 0
         emit("downloading", 0, size)
         with client.stream("GET", download_uri, timeout=None) as resp:
@@ -159,15 +215,10 @@ def build(out: Path, force: bool = False, progress=None) -> int | None:
         emit("downloading", got, total or got)
 
     print("[build] parsing + writing SQLite (streaming)…")
-    # Parse the bulk file straight off disk, one card at a time, so memory stays
-    # flat regardless of file size. The previous json.loads(read_text(...)) held
-    # the whole ~150MB file as a string AND the full ~30k-object graph at once,
-    # which blows past a 512MB instance and gets the process OOM-killed (SIGKILL,
-    # which no except-handler ever sees).
     try:
         count = _write_db(out, tmp, updated_at, progress=emit)
     finally:
-        tmp.unlink(missing_ok=True)  # always clear the ~150MB download temp
+        tmp.unlink(missing_ok=True)  # always clear the download temp
     print(f"[build] wrote {out} with {count} cards.")
     return count
 
@@ -259,14 +310,11 @@ def write_db(out: Path, records, updated_at: str, *,
 
 
 def _write_db(out: Path, src: Path, updated_at: str, progress=None) -> int:
-    """Live-download path: stream-parse the bulk JSON array at `src` into the
-    shared writer. 'item' yields each element of the top-level array in turn;
-    f.tell() is the byte offset ijson has consumed — a monotonic progress proxy."""
-    with open(src, "rb") as f:
-        return write_db(
-            out, ijson.items(f, "item"), updated_at,
-            progress=progress, tell=f.tell, total=src.stat().st_size or 1,
-        )
+    """Live-download path: stream the gzipped JSONL at `src` into the shared
+    writer, exactly as card_ingest.py does with a local bulk file."""
+    with bulk_stream(src) as (records, tell, total):
+        return write_db(out, records, updated_at,
+                        progress=progress, tell=tell, total=total)
 
 
 def _db_stamp(db: Path) -> str:

@@ -876,7 +876,7 @@ def admin_create(payload: dict = Body(...), _admin=Depends(_admin_guard), reques
 
 
 # NOTE: rebuilding the card cache is deliberately NOT an endpoint. It is a
-# >150MB download and a ~30k-card parse that runs a few times a year, so it
+# ~23MB download and a ~30k-card parse that runs a few times a year, so it
 # lives where long jobs belong - the command line:
 #
 #     python build_card_cache.py --force && restart the server
