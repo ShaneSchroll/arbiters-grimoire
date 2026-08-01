@@ -1,12 +1,11 @@
 """
 billing.py - Stripe subscription + prepaid usage credits.
 
-Money model
-  * $5/month subscription -> access to the app (Stripe Checkout, mode
+Money model (see SETUP-BILLING.md for the dashboard/Render/Cloudflare setup):
+  * $5/month subscription  -> access to the app (Stripe Checkout, mode
     "subscription"; the price lives on a dashboard Price whose id is
     STRIPE_PRICE_SUBSCRIPTION).
-
-  * Prepaid credit packs -> credits for actual AI usage (Checkout, mode
+  * Prepaid credit packs   -> fuel for actual AI usage (Checkout, mode
     "payment", inline price_data - no dashboard product needed). A paid pack
     credits its face value in micro-dollars; auth.record_usage deducts the
     marked-up cost of every request. Credits are NON-REFUNDABLE and capped at
@@ -19,6 +18,12 @@ state mirrored ONLY from signature-verified Stripe events (or from
 from the browser's success redirect. Crediting is idempotent via the UNIQUE
 stripe_ref column - Stripe retries deliveries and refresh re-lists old
 sessions, and both paths collapse into "already credited".
+
+Env:
+  STRIPE_SECRET_KEY          sk_test_... / sk_live_...   (unset = billing off)
+  STRIPE_WEBHOOK_SECRET      whsec_... for /api/stripe/webhook
+  STRIPE_PRICE_SUBSCRIPTION  price_... of the $5/mo recurring Price
+  APP_BASE_URL               https://arbitersgrimoire.com (checkout redirects)
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ CREDIT_PACKS_CENTS = (500, 1000, 2000)
 
 # Checkout/portal/refresh all call out to Stripe; keep one user from hammering
 # those round-trips. Session creation is cheap but not free.
-_billing_limit = auth._RateLimiter(10, timedelta(minutes=1))
+_billing_limit = auth._RateLimiter("billing", 10, timedelta(minutes=1))
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 webhook_router = APIRouter(tags=["billing"])
@@ -337,25 +342,29 @@ def resume_subscription(request: Request, user=Depends(auth.require_user)):
     return {"ok": True}
 
 
-class DailyLimitReq(BaseModel):
+class MonthlyLimitReq(BaseModel):
     usd: float
 
 
-@router.post("/daily-limit")
-def set_daily_limit(req: DailyLimitReq, request: Request, user=Depends(auth.require_user)):
-    """Let the user cap what they can burn through in a day. Their first
-    purchase seeds this with their whole balance (auth.ensure_daily_limit_default);
-    this is how they tighten it, and topping up later never moves it back."""
+@router.post("/monthly-limit")
+def set_monthly_limit(req: MonthlyLimitReq, request: Request, user=Depends(auth.require_user)):
+    """Let the user cap what they can burn through in a calendar month. Their
+    first purchase seeds this with their whole balance
+    (auth.ensure_monthly_limit_default); this is how they tighten it, and
+    topping up later never moves it back."""
     auth.require_same_origin(request)
     _rate_limit(user["id"])
-    lo = auth.MIN_DAILY_LIMIT_MICROS / 1_000_000
-    hi = auth.MAX_DAILY_LIMIT_MICROS / 1_000_000
+    lo = auth.MIN_MONTHLY_LIMIT_MICROS / 1_000_000
+    hi = auth.MAX_MONTHLY_LIMIT_MICROS / 1_000_000
     if not (lo <= req.usd <= hi):
         raise HTTPException(
-            400, f"Daily limit must be between ${lo:.2f} and ${hi:.0f}."
+            400, f"Monthly limit must be between ${lo:.2f} and ${hi:.0f}."
         )
-    auth.set_user_daily_limit(user["id"], int(round(req.usd * 1_000_000)))
-    return {"ok": True, "daily_limit": auth.daily_limit_view(auth.get_user_by_id(user["id"]))}
+    auth.set_user_monthly_limit(user["id"], int(round(req.usd * 1_000_000)))
+    return {
+        "ok": True,
+        "monthly_limit": auth.monthly_limit_view(auth.get_user_by_id(user["id"])),
+    }
 
 
 @router.get("/summary")
@@ -397,9 +406,9 @@ def billing_summary(user=Depends(auth.require_user)):
             "max_balance_usd": auth.MAX_CREDIT_BALANCE_USD,
             "headroom_usd": round(headroom / 1_000_000, 2),
         },
-        "daily_limit": auth.daily_limit_view(row),
-        "usage_today_usd": round(
-            auth.usage_today_credit_micros(row["id"]) / 1_000_000, 2
+        "monthly_limit": auth.monthly_limit_view(row),
+        "usage_month_usd": round(
+            auth.usage_month_credit_micros(row["id"]) / 1_000_000, 2
         ),
         "history": auth.credit_history(row["id"]),
     }

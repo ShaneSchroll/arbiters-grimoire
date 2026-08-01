@@ -1,11 +1,11 @@
 """
-card_cache.py - Read-only loader over cards.db (built by build_card_cache.py).
+card_cache.py — Read-only loader over cards.db (built by build_card_cache.py).
 
 This is the cards-side analogue of retriever.py: instantiate once at server
 startup (`cards = CardCache()`) and share the single instance across every
 request and every page. Both the Rules Oracle's lookup_card tool and the Deck
 Builder hit this same object, so "both pages share the cached card data" is
-satisfied at the source - one process-wide cache, zero network on the hot path.
+satisfied at the source — one process-wide cache, zero network on the hot path.
 
 Lookups are exact-by-normalized-name first, then a cheap local fuzzy fallback.
 A true miss returns None so the caller can decide whether to fall back to the

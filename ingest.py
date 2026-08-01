@@ -16,6 +16,9 @@ It writes two files next to this script:
                  plus one chunk per glossary term. retriever.py BM25-searches it.
   - docs.json  : section/subsection titles + per-rule text, for the in-app
                  rules page (/pages/rules).
+
+UTF-8 throughout: the rules contain characters like the real minus sign
+(U+2212) and curly quotes that Windows' default cp1252 codec can't write.
 """
 
 import json

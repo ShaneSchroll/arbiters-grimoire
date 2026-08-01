@@ -1,9 +1,11 @@
 """
 admin.py - Command-line user management for the MTG Rules Oracle.
 
+Run on the same host the server runs on (so it touches the same users.db).
+
   python admin.py list
   python admin.py create  alice@example.com [--admin] [--approved]
-  python admin.py approve alice@example.com
+  python admin.py approve alice@example.com | --all
   python admin.py revoke  alice@example.com
   python admin.py make-admin alice@example.com
   python admin.py reset   alice@example.com [--base-url https://oracle.example.com]
@@ -15,6 +17,12 @@ Purchased credits are non-refundable and capped at auth.MAX_CREDIT_BALANCE_USD
 per account; `credits` is the owner override for both (grants bypass the cap,
 and a negative amount claws back, e.g. to mirror a chargeback settled in
 Stripe).
+
+Bootstrap: the very first time you deploy, create your own admin user with
+  python admin.py create you@example.com --admin --approved
+Registration is open after that - accounts arrive usable, gated by the
+subscription + credits, not by a human. `revoke` suspends an account and
+`approve` puts it back, so approval is moderation rather than an intake queue.
 """
 
 from __future__ import annotations
@@ -32,9 +40,9 @@ def cmd_list(_):
     if not users:
         print("(no users)")
         return
-    print(f"{'EMAIL':36} {'APPR':5} {'ADMIN':6} {'BUDGET/DAY':12} {'SUB':10} {'CREDITS':10} CREATED")
+    print(f"{'EMAIL':36} {'ACTIVE':7} {'ADMIN':6} {'BUDGET/MO':12} {'SUB':10} {'CREDITS':10} CREATED")
     for u in users:
-        raw = u["daily_budget_micros"]
+        raw = u["monthly_budget_micros"]
         if raw is None:
             budget = "default"
         elif raw < 0:
@@ -45,7 +53,7 @@ def cmd_list(_):
         balance = f"${auth.credit_balance_micros(u['id']) / 1_000_000:.2f}"
         print(
             f"{u['email']:36} "
-            f"{'yes' if u['approved'] else 'no':5} "
+            f"{'yes' if u['approved'] else 'NO':7} "
             f"{'yes' if u['is_admin'] else 'no':6} "
             f"{budget:12} "
             f"{sub:10} "
@@ -74,6 +82,20 @@ def cmd_create(args):
 
 
 def cmd_approve(args):
+    """Reinstate a suspended account. Signups arrive approved, so this is
+    normally the undo for `revoke` - plus `--all`, which sweeps up accounts
+    left at approved=0 by the old approval-queue registration flow."""
+    if args.all:
+        reinstated = [u["email"] for u in auth.list_users() if not u["approved"]]
+        if not reinstated:
+            print("No suspended accounts.")
+            return
+        for email in reinstated:
+            auth.set_approved(email, True)
+        print(f"Reinstated {len(reinstated)} account(s): {', '.join(reinstated)}")
+        return
+    if not args.email:
+        sys.exit("Specify an email, or --all to reinstate every suspended account.")
     if auth.set_approved(args.email, True):
         print(f"Approved {args.email}")
     else:
@@ -81,8 +103,10 @@ def cmd_approve(args):
 
 
 def cmd_revoke(args):
+    """Suspend an account: they keep their credits and subscription but can't
+    sign in or use the app until `approve` puts them back."""
     if auth.set_approved(args.email, False):
-        print(f"Revoked approval for {args.email}")
+        print(f"Revoked access for {args.email}")
     else:
         sys.exit(f"No such user: {args.email}")
 
@@ -99,7 +123,9 @@ def cmd_reset(args):
     if not user:
         sys.exit(f"No such user: {args.email}")
     token = auth.create_reset_token(user["id"])
-    base = args.base_url or os.getenv("APP_BASE_URL", "http://localhost:8000")
+    # `or` rather than a getenv default: APP_BASE_URL set to "" is a real
+    # possibility, and it would print a reset link with no host in it.
+    base = args.base_url or os.getenv("APP_BASE_URL") or "http://localhost:8000"
     print("Single-use reset link (valid for 24 hours):")
     print(f"  {base.rstrip('/')}/reset?token={token}")
 
@@ -121,9 +147,10 @@ def _fmt_usd(micros: int) -> str:
 
 
 def cmd_budget(args):
-    """Override a user's daily spend limit, in credit dollars. Users set their
-    own on /account (seeded from their balance at first purchase); this is the
-    admin path, and the only one that can clear the limit or lift it entirely."""
+    """Override a user's monthly spend limit, in credit dollars. Users set
+    their own on /account (seeded from their balance at first purchase); this
+    is the admin path, and the only one that can clear the limit or lift it
+    entirely."""
     if args.unlimited:
         micros = -1
     elif args.default:
@@ -135,25 +162,25 @@ def cmd_budget(args):
     else:
         sys.exit("Specify one of --usd N, --unlimited, or --default.")
 
-    if not auth.set_daily_budget(args.email, micros):
+    if not auth.set_monthly_budget(args.email, micros):
         sys.exit(f"No such user: {args.email}")
 
     if micros is None:
-        print(f"{args.email}: daily budget reset to default "
-              f"({_fmt_usd(auth.DEFAULT_DAILY_BUDGET_MICROS)}/day).")
+        print(f"{args.email}: monthly budget reset to default "
+              f"({_fmt_usd(auth.DEFAULT_MONTHLY_BUDGET_MICROS)}/month).")
     elif micros < 0:
-        print(f"{args.email}: daily budget set to UNLIMITED.")
+        print(f"{args.email}: monthly budget set to UNLIMITED.")
     else:
-        print(f"{args.email}: daily budget set to {_fmt_usd(micros)}/day.")
+        print(f"{args.email}: monthly budget set to {_fmt_usd(micros)}/month.")
 
 
 def cmd_usage(args):
-    """Today's spend against the daily limit. Both are CREDIT dollars (what
-    the user's balance drops by); `raw cost` is what we pay Anthropic."""
-    s = auth.usage_summary_today(args.email)
+    """This month's spend against the monthly limit. Both are CREDIT dollars
+    (what the user's balance drops by); `raw cost` is what we pay Anthropic."""
+    s = auth.usage_summary_month(args.email)
     if s is None:
         sys.exit(f"No such user: {args.email}")
-    print(f"{s['email']} - usage today (resets 00:00 UTC):")
+    print(f"{s['email']} - usage this month (resets on the 1st, 00:00 UTC):")
     print(f"  spent:     {_fmt_usd(s['spent_micros'])} of credits")
     print(f"  raw cost:  {_fmt_usd(s['raw_micros'])}")
     if s["unlimited"]:
@@ -197,12 +224,18 @@ def main():
     sp.add_argument("--approved", action="store_true")
     sp.set_defaults(func=cmd_create)
 
-    for name, func in [
-        ("approve", cmd_approve),
-        ("revoke", cmd_revoke),
-        ("make-admin", cmd_make_admin),
+    sp = sub.add_parser("approve", help="Reinstate a suspended account")
+    sp.add_argument("email", nargs="?")
+    sp.add_argument("--all", action="store_true",
+                    help="Reinstate every suspended account (e.g. signups left "
+                         "pending by the old approval queue)")
+    sp.set_defaults(func=cmd_approve)
+
+    for name, func, helptext in [
+        ("revoke", cmd_revoke, "Suspend an account"),
+        ("make-admin", cmd_make_admin, "Grant admin rights"),
     ]:
-        sp = sub.add_parser(name)
+        sp = sub.add_parser(name, help=helptext)
         sp.add_argument("email")
         sp.set_defaults(func=func)
 
@@ -216,15 +249,15 @@ def main():
     sp.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     sp.set_defaults(func=cmd_delete)
 
-    sp = sub.add_parser("budget", help="Set a user's daily spend limit")
+    sp = sub.add_parser("budget", help="Set a user's monthly spend limit")
     sp.add_argument("email")
     g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--usd", type=float, help="Daily limit in credit dollars, e.g. 2.50")
-    g.add_argument("--unlimited", action="store_true", help="No daily cap")
+    g.add_argument("--usd", type=float, help="Monthly limit in credit dollars, e.g. 2.50")
+    g.add_argument("--unlimited", action="store_true", help="No monthly cap")
     g.add_argument("--default", action="store_true", help="Use the global default")
     sp.set_defaults(func=cmd_budget)
 
-    sp = sub.add_parser("usage", help="Show a user's spend so far today")
+    sp = sub.add_parser("usage", help="Show a user's spend so far this month")
     sp.add_argument("email")
     sp.set_defaults(func=cmd_usage)
 

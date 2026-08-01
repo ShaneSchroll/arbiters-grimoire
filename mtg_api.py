@@ -1,8 +1,8 @@
 """
-mtg_api.py - Card lookups for the Rules Oracle and Deck Builder.
+mtg_api.py — Card lookups for the Rules Oracle and Deck Builder.
 
 Now cache-first: lookup_card consults the local CardCache (cards.db) and only
-touches the live Scryfall API on a miss - e.g. a card printed after the last
+touches the live Scryfall API on a miss — e.g. a card printed after the last
 bulk build. Misses are memoized so a given name hits the network at most once
 per process. This keeps the rules tool working for brand-new cards while
 respecting Scryfall's "don't crawl us" guidance for everything already cached.
@@ -37,25 +37,15 @@ def _remember(key: str, result: dict) -> dict:
 
 def get_cache() -> CardCache:
     """Lazily open the shared, process-wide card cache. Both pages call this,
-    so they read the same instance. Raises if cards.db hasn't been built yet."""
+    so they read the same instance. Raises if cards.db hasn't been built yet.
+
+    The handle is held for the life of the process, so a cards.db rebuilt
+    underneath it (build_card_cache.py writes a temp file and renames over the
+    old one) is not picked up until restart - which is the documented last step
+    of a card refresh, and conveniently also drops the stale live-miss memo."""
     global _cache
     if _cache is None:
         _cache = CardCache()
-    return _cache
-
-
-def reload_cache() -> CardCache:
-    """Re-open cards.db and swap in a fresh CardCache. Called after an admin
-    'Get Latest Cards' rebuild so new cards go live without a server restart.
-
-    Reassigning the module reference is atomic, so in-flight requests that
-    already hold the old instance keep reading it safely; new requests pick up
-    the new one. The old connection is closed by GC once nothing references it.
-    Also clears memoized live misses, since a name that missed before may now
-    be in the cache."""
-    global _cache
-    _cache = CardCache()
-    _live_misses.clear()
     return _cache
 
 
@@ -78,7 +68,7 @@ def _live_lookup(name: str) -> dict:
     if r.status_code == 404:
         # Memoize the definitive no-match too: without this, every repeat of a
         # junk name is a fresh outbound request — an easy way for one user to
-        # crawl Scryfall through us. Cleared on cache rebuild like the hits.
+        # crawl Scryfall through us. Cleared on restart, like the hits.
         return _remember(key, {"error": f"no card found matching '{name}'"})
     if r.status_code != 200:
         # Transient upstream trouble (5xx, rate limit) — do NOT memoize, so the

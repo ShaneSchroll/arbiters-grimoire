@@ -8,14 +8,20 @@ Flow for each user question:
   4. Return Claude's final answer plus the rule sources used.
 
 Auth:
-  The chat endpoint requires an approved, signed-in user. Account creation and
-  approval are handled in auth.py + admin.py.
+  The chat endpoint requires a signed-in, non-suspended user. Registration is
+  open (accounts arrive approved); auth.py + admin.py own account creation and
+  the revoke/reinstate switch. See admin.py for bootstrap.
+
+Run:  uvicorn server:app --port 8000
+Behind a proxy (Render):
+      uvicorn server:app --host 0.0.0.0 --port 8000 \\
+              --proxy-headers --forwarded-allow-ips '*'
+  so that request.url.scheme reports https and cookies get the Secure flag.
 """
 
 import json
 import os
 import re
-import card_refresh
 import deckbuilder
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -388,15 +394,15 @@ def chat(req: ChatRequest, request: Request, user=Depends(auth.require_user)):
             detail="Rate limit exceeded. Please wait a moment and try again.",
         )
     # Subscription + prepaid credits (402 when BILLING_REQUIRED is on and the
-    # user lacks either). Checked before the daily limit: the limit stays as a
-    # per-user runaway cap on top of the credit balance, and is the user's own
-    # choice once they've bought credits (see auth.daily_limit_view).
+    # user lacks either). Checked before the monthly limit: the limit stays as
+    # a per-user runaway cap on top of the credit balance, and is the user's
+    # own choice once they've bought credits (see auth.monthly_limit_view).
     auth.require_billing(user)
-    if auth.daily_budget_exceeded(user["id"]):
+    if auth.monthly_budget_exceeded(user["id"]):
         raise HTTPException(
             status_code=429,
-            detail="Daily spend limit reached. It resets at 00:00 UTC, or you "
-                   "can raise it on your Account page.",
+            detail="Monthly spend limit reached. It resets on the 1st of next "
+                   "month, or you can raise it on your Account page.",
         )
 
     # Every signed-in user may pick any allowed model; an unknown or
@@ -699,13 +705,13 @@ def _admin_guard(request: Request):
 
 
 def _user_view(row) -> dict:
-    """Shape a user row for the admin table, including today's spend. The
+    """Shape a user row for the admin table, including this month's spend. The
     limit and `spent_usd` are credit dollars (what the balance drops by);
     `raw_spent_usd` is what we actually pay Anthropic."""
     budget = auth._budget_for(row["id"])
-    raw_spent = auth.usage_today_micros(row["id"])
-    spent = auth.usage_today_credit_micros(row["id"])
-    raw = row["daily_budget_micros"] if "daily_budget_micros" in row.keys() else None
+    raw_spent = auth.usage_month_micros(row["id"])
+    spent = auth.usage_month_credit_micros(row["id"])
+    raw = row["monthly_budget_micros"] if "monthly_budget_micros" in row.keys() else None
     return {
         "email": row["email"],
         "approved": bool(row["approved"]),
@@ -730,7 +736,7 @@ def _user_view(row) -> dict:
 def admin_list_users(_admin=Depends(auth.require_admin)):
     return {
         "users": [_user_view(u) for u in auth.list_users()],
-        "default_budget_usd": round(auth.DEFAULT_DAILY_BUDGET_MICROS / 1_000_000, 2),
+        "default_budget_usd": round(auth.DEFAULT_MONTHLY_BUDGET_MICROS / 1_000_000, 2),
     }
 
 
@@ -781,7 +787,7 @@ def admin_set_budget(payload: dict = Body(...), _admin=Depends(_admin_guard)):
         micros = int(round(usd * 1_000_000))
     else:
         raise HTTPException(400, "mode must be one of: usd, unlimited, default.")
-    if not auth.set_daily_budget(email, micros):
+    if not auth.set_monthly_budget(email, micros):
         raise HTTPException(404, f"No such user: {email}")
     return {"ok": True}
 
@@ -869,14 +875,16 @@ def admin_create(payload: dict = Body(...), _admin=Depends(_admin_guard), reques
     }
 
 
-@admin_router.post("/refresh-cards")
-def admin_refresh_cards(payload: dict = Body(default={}), _admin=Depends(_admin_guard)):
-    # _admin_guard = same-origin + admin, matching your other state-changing routes
-    return card_refresh.start_refresh(force=bool(payload.get("force", False)))
-
-@admin_router.get("/refresh-cards/status")
-def admin_refresh_cards_status(_admin=Depends(auth.require_admin)):
-    return card_refresh.get_status()
+# NOTE: rebuilding the card cache is deliberately NOT an endpoint. It is a
+# >150MB download and a ~30k-card parse that runs a few times a year, so it
+# lives where long jobs belong - the command line:
+#
+#     python build_card_cache.py --force && restart the server
+#
+# Serving it over HTTP meant a background thread and a status dict inside the
+# web process, which pinned the deployment to exactly one uvicorn worker: the
+# thread ran in whichever worker answered the POST, and the status poll could
+# land on any of the others.
 
 
 app.include_router(admin_router)
@@ -904,6 +912,6 @@ def admin_page(request: Request):
     if not user or not user["approved"]:
         return RedirectResponse("/login", status_code=302)
     if not user["is_admin"]:
-        # Approved non-admins get bounced to the app rather than the panel.
+        # Ordinary users get bounced to the app rather than the panel.
         return RedirectResponse("/", status_code=302)
     return _serve_page("admin/index.html")

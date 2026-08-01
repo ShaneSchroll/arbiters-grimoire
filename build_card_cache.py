@@ -1,21 +1,30 @@
 """
-build_card_cache.py - Download Scryfall's `oracle_cards` bulk file once and
+build_card_cache.py — Download Scryfall's `oracle_cards` bulk file once and
 build a local SQLite card cache for instant, offline lookups.
 
-This is the cards-side analogue of ingest.py: a build step that
+This is the cards-side analogue of ingest.py: a one-shot build step that
 produces an artifact (cards.db) the running server loads read-only via
-card_cache.CardCache - exactly how Retriever loads rules.json.
+card_cache.CardCache — exactly how Retriever loads rules.json.
 
 Why bulk data instead of looping the API:
   Scryfall explicitly asks you NOT to fetch cards one-by-one for catalog-scale
   work. The `oracle_cards` file is one object per functionally-unique card
   (~30k rows), updated roughly every 12h. Gameplay text changes rarely, so a
-  weekly rebuild (or a rebuild after a set release) is plenty.
+  rebuild after a set release is plenty.
 
 Usage:
     python build_card_cache.py                 # build ./cards.db
     python build_card_cache.py --out cards.db  # custom path
     python build_card_cache.py --force         # rebuild even if fresh
+
+This is the whole card refresh, and it runs from a shell — never from the web
+process. It downloads >150MB and parses ~30k cards, which is minutes of work
+with no HTTP request that could sensibly wait on it, and keeping it out here is
+what lets the app run more than one uvicorn worker. Restart the server
+afterwards: it holds cards.db open, so it keeps serving the old file until it
+does. Run it in your deploy/build step (next to `python ingest.py rules.txt`) or
+by hand when a set drops. No new dependencies: httpx is already in your
+requirements, sqlite3 ships with Python.
 """
 
 from __future__ import annotations
@@ -37,7 +46,8 @@ BULK_TYPE = "oracle_cards"  # one row per gameplay-unique card
 USER_AGENT = "mtg-rules-assistant/1.0"
 ACCEPT = "application/json;q=0.9,*/*;q=0.8"  # Scryfall asks clients to send Accept
 # cards.db location. Configurable like AUTH_DB_PATH so it can live on a
-# persistent disk rather than the phemeral code directory; defaults next to this script for local dev.
+# persistent disk (e.g. CARD_DB_PATH=/var/data/cards.db) rather than the
+# ephemeral code directory; defaults next to this script for local dev.
 DEFAULT_OUT = Path(os.getenv("CARD_DB_PATH") or Path(__file__).resolve().parent / "cards.db")
 
 # Layouts with no rules text worth ruling on — skipped so they don't pollute
@@ -107,12 +117,15 @@ def fetch_bulk_download_uri(client: httpx.Client) -> tuple[str, str, int]:
 ProgressFn = "Callable[[str, int, int], None] | None"
 
 
-def build(out: Path, force: bool = False, progress=None) -> None:
-    """Build cards.db. `progress`, if given, is called as
-    progress(phase, done, total) with byte counts during the two long phases:
-    phase is "downloading" then "parsing". It's a plain callback — the caller
-    decides how (and how often) to surface it; callers should throttle. None
-    keeps the CLI path side-effect-free."""
+def build(out: Path, force: bool = False, progress=None) -> int | None:
+    """Build cards.db. Returns the number of cards written, or None if the file
+    already reflected Scryfall's current bulk version and nothing was done —
+    which is what tells the caller whether a server restart is even warranted.
+
+    `progress`, if given, is called as progress(phase, done, total) with byte
+    counts during the two long phases: phase is "downloading" then "parsing".
+    It's a plain callback — the caller decides how (and how often) to surface
+    it. None keeps the function silent apart from its own status lines."""
     def emit(phase, done, total):
         if progress is not None:
             progress(phase, done, total)
@@ -126,7 +139,7 @@ def build(out: Path, force: bool = False, progress=None) -> None:
         if out.exists() and not force and _db_stamp(out) == updated_at and updated_at:
             print(f"[build] {out.name} already current — nothing to do "
                   f"(use --force to rebuild).")
-            return
+            return None
 
         print(f"[build] downloading {download_uri}")
         # The file is large (>150MB raw). Stream it straight to disk instead of
@@ -150,12 +163,13 @@ def build(out: Path, force: bool = False, progress=None) -> None:
     # flat regardless of file size. The previous json.loads(read_text(...)) held
     # the whole ~150MB file as a string AND the full ~30k-object graph at once,
     # which blows past a 512MB instance and gets the process OOM-killed (SIGKILL,
-    # so card_refresh's except-handler never even sees it).
+    # which no except-handler ever sees).
     try:
         count = _write_db(out, tmp, updated_at, progress=emit)
     finally:
         tmp.unlink(missing_ok=True)  # always clear the ~150MB download temp
     print(f"[build] wrote {out} with {count} cards.")
+    return count
 
 
 # Throwaway temp-db pragmas + schema. journal_mode=OFF + synchronous=OFF: this
@@ -267,16 +281,45 @@ def _db_stamp(db: Path) -> str:
         return ""
 
 
+def _cli_progress():
+    """A terminal progress bar, in the shape `build` wants for its `progress`
+    callback. This is minutes of silence otherwise — the same reason the old
+    admin button had a progress bar, just rendered where the job now runs.
+
+    Returns a closure because it has to remember the current phase: `build`
+    prints its own status lines between phases, and they would land on top of an
+    unterminated `\\r` bar."""
+    state = {"phase": None}
+
+    def emit(phase: str, done: int, total: int) -> None:
+        if state["phase"] not in (None, phase):
+            print()  # phase changed mid-bar; close the old line first
+        state["phase"] = phase
+        pct = int(done * 100 / total) if total else 0
+        pct = max(0, min(100, pct))
+        bar = "#" * (pct // 4)
+        print(f"\r[build] {phase}: {pct:3d}%  |{bar:<25}|", end="", flush=True)
+        if total and done >= total:
+            print()
+            state["phase"] = None
+
+    return emit
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Build a local Scryfall card cache.")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output SQLite path")
     ap.add_argument("--force", action="store_true", help="rebuild even if current")
     args = ap.parse_args(argv)
     try:
-        build(args.out, force=args.force)
+        count = build(args.out, force=args.force, progress=_cli_progress())
     except httpx.HTTPError as e:
         print(f"[build] network/HTTP error talking to Scryfall: {e}", file=sys.stderr)
         return 1
+    if count is not None:
+        # A running server opened cards.db before the rename and keeps reading
+        # the old file, so the rebuild isn't live until it reopens.
+        print("[build] restart the server to serve the new cards.")
     return 0
 
 

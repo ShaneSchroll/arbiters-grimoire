@@ -30,3 +30,5 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+
+stripe.txt

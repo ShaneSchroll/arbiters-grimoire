@@ -10,7 +10,6 @@ import hashlib
 import os
 import secrets
 import sqlite3
-import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,7 +24,23 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("AUTH_DB_PATH", BASE_DIR / "users.db"))
+
+
+def _env(name: str, default: str) -> str:
+    """Environment lookup that treats a blank value as unset.
+
+    os.getenv() only falls back when the key is ABSENT, and a key set to the
+    empty string is very easy to produce by accident: `FOO=` in an env file
+    (python-dotenv puts it in os.environ as "") and a Render dashboard row with
+    the value field left empty both do it. Without this, `CREDIT_MARKUP=` would
+    reach float("") and take the whole app down at import with a ValueError
+    naming neither the variable nor the file. Blank now means "use the default",
+    which is what anyone writing it meant.
+    """
+    return (os.getenv(name) or "").strip() or default
+
+
+DB_PATH = Path(_env("AUTH_DB_PATH", str(BASE_DIR / "users.db")))
 
 SESSION_COOKIE = "session"
 SESSION_TTL = timedelta(days=30)
@@ -61,15 +76,15 @@ PWLINK_MAX = 5
 # inward: Render alone = 1; Cloudflare -> Render = 2. The env var MUST match
 # the real chain: too low and per-IP rate limits key on a proxy's (shared) IP;
 # too high and clients can spoof their IP via X-Forwarded-For.
-TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
+TRUSTED_PROXY_HOPS = int(_env("TRUSTED_PROXY_HOPS", "1"))
 
 # ---------- spend accounting ----------
-# Daily spend cap for an account that has never bought credits. Denominated in
-# CREDIT dollars (what the balance actually drops by), not raw Anthropic cost -
-# see usage_today_credit_micros. Buying credits replaces this with the user's
-# own limit, defaulting to their balance (ensure_daily_limit_default).
-DEFAULT_DAILY_BUDGET_MICROS = int(
-    float(os.getenv("DAILY_BUDGET_USD", "1.00")) * 1_000_000
+# Monthly spend cap for an account that has never bought credits. Denominated
+# in CREDIT dollars (what the balance actually drops by), not raw Anthropic
+# cost - see usage_month_credit_micros. Buying credits replaces this with the
+# user's own limit, defaulting to their balance (ensure_monthly_limit_default).
+DEFAULT_MONTHLY_BUDGET_MICROS = int(
+    float(_env("MONTHLY_BUDGET_USD", "5.00")) * 1_000_000
 )
 
 PRICING = {
@@ -78,7 +93,7 @@ PRICING = {
     },
 }
 # Fallback for an unrecognized model: the most expensive rate in each column,
-# so an unknown model can never be under-billed past the budget.
+# so an unknown model can never be under-billed past the monthly budget.
 _FALLBACK_RATE = {
     field: max(p[field] for p in PRICING.values())
     for field in ("input", "output", "cache_write", "cache_read")
@@ -89,26 +104,26 @@ _FALLBACK_RATE = {
 # enforced and usage does not deduct credits, so this code can be deployed,
 # Stripe configured, and credits granted/tested before anyone is locked out.
 # Flip BILLING_REQUIRED=1 only after the SETUP-BILLING.md checklist is done.
-BILLING_REQUIRED = os.getenv("BILLING_REQUIRED", "0").lower() in ("1", "true", "yes")
+BILLING_REQUIRED = _env("BILLING_REQUIRED", "0").lower() in ("1", "true", "yes")
 
 # Multiplier applied to the raw Anthropic cost when deducting credits. Covers
 # Stripe's fee (2.9% + $0.30), the retrieval context the user never sees, and
 # margin. The usage_ledger keeps recording RAW cost; only the credit deduction
 # is marked up, so the markup can be tuned without rewriting history.
-CREDIT_MARKUP = float(os.getenv("CREDIT_MARKUP", "1.4"))
+CREDIT_MARKUP = float(_env("CREDIT_MARKUP", "1.4"))
 
 # Hard ceiling on the credits one account may hold at once. Credits are
 # non-refundable, so this bounds what any single change of heart (or
 # chargeback) can be worth. Enforced at checkout - billing.py refuses a pack
 # that would overshoot - and surfaced as disabled pack buttons on /account.
-MAX_CREDIT_BALANCE_USD = float(os.getenv("MAX_CREDIT_BALANCE_USD", "20"))
+MAX_CREDIT_BALANCE_USD = float(_env("MAX_CREDIT_BALANCE_USD", "20"))
 MAX_CREDIT_BALANCE_MICROS = int(MAX_CREDIT_BALANCE_USD * 1_000_000)
 
-# Bounds on the daily limit a user may choose for themselves. The floor keeps a
-# stray "0" from silently refusing every request; the ceiling is the most
+# Bounds on the monthly limit a user may choose for themselves. The floor keeps
+# a stray "0" from silently refusing every request; the ceiling is the most
 # credits they could hold anyway, so anything higher is the same as no limit.
-MIN_DAILY_LIMIT_MICROS = 250_000  # $0.25
-MAX_DAILY_LIMIT_MICROS = MAX_CREDIT_BALANCE_MICROS
+MIN_MONTHLY_LIMIT_MICROS = 250_000  # $0.25
+MAX_MONTHLY_LIMIT_MICROS = MAX_CREDIT_BALANCE_MICROS
 
 # Subscription statuses that count as "may use the app". 'active'/'trialing'
 # come from Stripe; 'comp' is a local, admin-granted status Stripe never sets
@@ -125,7 +140,7 @@ SUB_GRACE = timedelta(days=3)
 # registration. It opens the subscription half of the gate only - usage still
 # needs purchased credits - so nobody spends API dollars for free, and
 # cancelling before it runs out simply means never being charged.
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+TRIAL_DAYS = int(_env("TRIAL_DAYS", "7"))
 
 PASSWORD_MIN_LEN = 12
 # Upper bound applied at the API boundary. Without one, uvicorn accepts
@@ -152,91 +167,6 @@ _ph = PasswordHasher()
 # Used to keep the argon2 verify cost constant when the email doesn't exist,
 # so an attacker can't tell registered emails from unregistered ones by timing.
 _DUMMY_HASH = _ph.hash("not-a-real-password-only-for-timing-safety")
-
-# Cap on distinct keys any single limiter will track, so a flood of distinct
-# keys (e.g. login failures with rotating emails) can't exhaust memory.
-_MAX_TRACKED_KEYS = 20_000
-
-
-class _RateLimiter:
-    """In-memory sliding-window limiter keyed by an arbitrary string.
-
-    NOT durable: state is per-process and resets on restart, and is not shared
-    across workers. With a single worker (recommended for this deployment) it
-    is sufficient; if you scale out, move these counters to the DB or a shared
-    store, or each worker will enforce the limit independently.
-    """
-
-    def __init__(self, max_events: int, window: timedelta) -> None:
-        self._max = max_events
-        self._window = window.total_seconds()
-        self._hits: dict[str, list[float]] = {}
-        self._lock = threading.Lock()
-
-    def _recent(self, key: str, now: float) -> list[float]:
-        cutoff = now - self._window
-        kept = [t for t in self._hits.get(key, ()) if t > cutoff]
-        if kept:
-            self._hits[key] = kept
-        else:
-            self._hits.pop(key, None)
-        return kept
-
-    def _sweep(self, now: float) -> None:
-        if len(self._hits) <= _MAX_TRACKED_KEYS:
-            return
-        cutoff = now - self._window
-        self._hits = {
-            k: recent
-            for k, ts in self._hits.items()
-            if (recent := [t for t in ts if t > cutoff])
-        }
-
-    def blocked(self, key: str) -> bool:
-        """True if the key is already at/over the limit (no event recorded)."""
-        with self._lock:
-            return len(self._recent(key, time.time())) >= self._max
-
-    def record(self, key: str) -> None:
-        """Record one event against the key."""
-        with self._lock:
-            now = time.time()
-            self._sweep(now)
-            self._recent(key, now)
-            self._hits.setdefault(key, []).append(now)
-
-    def hit(self, key: str) -> bool:
-        """Record one event and return True if the key is now over the limit."""
-        with self._lock:
-            now = time.time()
-            self._sweep(now)
-            events = self._recent(key, now)
-            events.append(now)
-            self._hits[key] = events
-            return len(events) > self._max
-
-    def clear(self, key: str) -> None:
-        with self._lock:
-            self._hits.pop(key, None)
-
-
-_login_fail = _RateLimiter(LOGIN_MAX_FAILS, LOGIN_WINDOW)
-_login_ip = _RateLimiter(LOGIN_IP_MAX_FAILS, LOGIN_WINDOW)
-_register_limit = _RateLimiter(REGISTER_MAX, REGISTER_WINDOW)
-_chat_limit = _RateLimiter(CHAT_MAX, CHAT_WINDOW)
-_card_limit = _RateLimiter(CARD_MAX, CARD_WINDOW)
-_pwlink_limit = _RateLimiter(PWLINK_MAX, PWLINK_WINDOW)
-
-
-def chat_rate_limited(user_id: int) -> bool:
-    """Record a chat request for this user; True if they are now over CHAT_MAX."""
-    return _chat_limit.hit(str(user_id))
-
-
-def card_rate_limited(user_id: int) -> bool:
-    """Record a card lookup for this user; True if they are now over CARD_MAX."""
-    return _card_limit.hit(str(user_id))
-
 
 # ---------- low-level helpers ----------
 
@@ -266,6 +196,26 @@ def _db():
         conn.close()
 
 
+@contextmanager
+def _write_tx(conn: sqlite3.Connection):
+    """Wrap a read-then-write so it is atomic against other processes.
+
+    The connection is in autocommit, so each statement would otherwise commit on
+    its own and two workers could both read "4 events" before either inserted
+    its fifth. BEGIN IMMEDIATE takes SQLite's write lock up front, which
+    serializes the whole read-decide-write against every other worker on the
+    same file. Waiting for that lock is bounded by sqlite3's busy timeout (5s
+    by default) — far beyond anything these millisecond transactions need.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
 def init_db() -> None:
     with _db() as db:
         db.executescript(
@@ -274,7 +224,10 @@ def init_db() -> None:
               id            INTEGER PRIMARY KEY AUTOINCREMENT,
               email         TEXT    NOT NULL UNIQUE,
               password_hash TEXT    NOT NULL,
-              approved      INTEGER NOT NULL DEFAULT 0,
+              -- Registration is open: accounts start usable and `approved` is
+              -- a moderation switch (admin.py revoke / approve) rather than a
+              -- gate every signup has to wait behind.
+              approved      INTEGER NOT NULL DEFAULT 1,
               is_admin      INTEGER NOT NULL DEFAULT 0,
               created_at    TEXT    NOT NULL
             );
@@ -327,6 +280,17 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_conversations_user
               ON conversations(user_id, updated_at);
+            CREATE TABLE IF NOT EXISTS rate_limits (
+              bucket     TEXT NOT NULL,  -- which limiter: 'chat', 'login_ip', …
+              key        TEXT NOT NULL,  -- what it counts: user id, IP, ip+email
+              -- Unix seconds, not the ISO text the tables above use: these
+              -- windows are sub-minute and the limiter is on the request hot
+              -- path, so a float that compares and adds directly beats
+              -- formatting and parsing a timestamp on every call.
+              expires_at REAL NOT NULL   -- when this event leaves its window
+            );
+            CREATE INDEX IF NOT EXISTS idx_rate_limits
+              ON rate_limits(bucket, key, expires_at);
             """
         )
         _migrate(db)
@@ -343,18 +307,37 @@ def _migrate(db: sqlite3.Connection) -> None:
         # Optional display name captured at registration. NULL means "unset",
         # in which case the UI falls back to the email's local-part.
         db.execute("ALTER TABLE users ADD COLUMN name TEXT")
-    if "daily_budget_micros" not in cols:
-        # The daily spend limit, in credit dollars. Nullable: NULL means "use
-        # DEFAULT_DAILY_BUDGET_MICROS" and is the state of an account that has
-        # never bought credits. A negative value means unlimited (admin only).
-        # Anything else is the limit the user picked, or the balance snapshot
-        # ensure_daily_limit_default wrote at their first purchase.
-        db.execute("ALTER TABLE users ADD COLUMN daily_budget_micros INTEGER")
-    if "opus_allowed" not in cols:
-        # Vestigial: per-user Opus gating was removed (every user can use every
-        # model now). Retained so existing and fresh DBs share one schema;
-        # nothing reads it anymore.
-        db.execute("ALTER TABLE users ADD COLUMN opus_allowed INTEGER NOT NULL DEFAULT 0")
+    if "monthly_budget_micros" not in cols:
+        # The monthly spend limit, in credit dollars. Nullable: NULL means "use
+        # DEFAULT_MONTHLY_BUDGET_MICROS" and is the state of an account that
+        # has never bought credits. A negative value means unlimited (admin
+        # only). Anything else is the limit the user picked, or the balance
+        # snapshot ensure_monthly_limit_default wrote at their first purchase.
+        db.execute("ALTER TABLE users ADD COLUMN monthly_budget_micros INTEGER")
+        if "daily_budget_micros" in cols:
+            # Carry the old per-day limits over verbatim. They were seeded from
+            # the balance and bounded by the same [MIN, MAX] range as the new
+            # column, so every stored value is still a valid monthly figure -
+            # just a stricter one, which is the safe direction to land in.
+            db.execute(
+                "UPDATE users SET monthly_budget_micros = daily_budget_micros"
+            )
+    # Columns that no longer back anything: the pre-monthly spend limit, and
+    # per-user Opus gating (every user gets the same model now). Dropped rather
+    # than left dangling so the row can't drift out of sync with the code that
+    # reads it. DROP COLUMN needs SQLite 3.35+; on anything older the columns
+    # simply stay put, unread and harmless.
+    for dead in ("daily_budget_micros", "opus_allowed"):
+        if dead in cols:
+            try:
+                db.execute(f"ALTER TABLE users DROP COLUMN {dead}")
+            except sqlite3.OperationalError:
+                pass
+    # NOTE: `approved` gained a DEFAULT of 1 (registration is open). SQLite
+    # can't alter a column default in place, but nothing relies on it - every
+    # insert passes `approved` explicitly - so existing databases need no
+    # rewrite. Accounts already sitting at approved=0 stay that way; approve
+    # them with `python admin.py approve <email>` (or `approve --all`).
     if "stripe_customer_id" not in cols:
         # The Stripe Customer this user maps to. Created lazily on their first
         # checkout; webhooks resolve users through it. Uniqueness is enforced
@@ -390,8 +373,9 @@ def _migrate(db: sqlite3.Connection) -> None:
 
 
 def _cleanup_expired() -> None:
-    """Delete rows that can no longer authenticate anything, so the sessions
-    and reset_tokens tables don't grow without bound on the persistent disk."""
+    """Delete rows that can no longer authenticate or count against anything, so
+    sessions, reset_tokens and rate_limits don't grow without bound on the
+    persistent disk."""
     now_iso = _now().isoformat()
     with _db() as db:
         db.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso,))
@@ -399,6 +383,121 @@ def _cleanup_expired() -> None:
             "DELETE FROM reset_tokens WHERE expires_at <= ? OR used_at IS NOT NULL",
             (now_iso,),
         )
+        # Every rate_limits row carries its own expiry, so one statement sweeps
+        # every bucket — including buckets no limiter uses any more. Live
+        # buckets also prune themselves on write; this catches the ones that
+        # went quiet, and whatever went stale while the app was down.
+        db.execute("DELETE FROM rate_limits WHERE expires_at <= ?", (time.time(),))
+
+
+# ---------- rate limiting ----------
+# Shared, not process-local: the counters live in users.db, so N uvicorn workers
+# enforce ONE limit instead of N of them. They also survive a restart, so a
+# redeploy no longer hands an attacker mid-spray a fresh budget.
+
+# Hard ceiling on the rows one bucket may hold at once. Expired rows are pruned
+# on every write, so this only bites during a flood of distinct keys from many
+# IPs at once; it then drops the closest-to-expiring rows first, which keeps the
+# disk bounded at the cost of forgiving the oldest offenders slightly early.
+_MAX_BUCKET_ROWS = 50_000
+
+
+class _RateLimiter:
+    """Sliding-window limiter keyed by an arbitrary string, stored in the
+    `rate_limits` table: one row per event, holding the moment that event stops
+    counting.
+
+    `record` and `hit` run inside `_write_tx`, which is what makes
+    count-then-insert atomic between workers. `blocked` is a single SELECT and
+    needs no transaction.
+
+    A SQLite error propagates rather than failing open. Anything that reaches a
+    limiter has already read users.db to resolve the session, so a database that
+    can't be read was going to fail the request either way — and a limiter that
+    silently stopped counting is exactly the failure this table exists to
+    prevent.
+    """
+
+    def __init__(self, bucket: str, max_events: int, window: timedelta) -> None:
+        self._bucket = bucket
+        self._max = max_events
+        self._window = window.total_seconds()
+
+    def _live(self, db: sqlite3.Connection, key: str, now: float) -> int:
+        """Events for `key` still inside the window."""
+        return db.execute(
+            "SELECT COUNT(*) FROM rate_limits "
+            "WHERE bucket = ? AND key = ? AND expires_at > ?",
+            (self._bucket, key, now),
+        ).fetchone()[0]
+
+    def _add(self, db: sqlite3.Connection, key: str, now: float) -> None:
+        # Prune the bucket's dead rows on the way in. One delete per insert
+        # amortized, so the table settles at roughly the number of events
+        # actually inside the window rather than growing with total traffic.
+        db.execute(
+            "DELETE FROM rate_limits WHERE bucket = ? AND expires_at <= ?",
+            (self._bucket, now),
+        )
+        db.execute(
+            "INSERT INTO rate_limits (bucket, key, expires_at) VALUES (?, ?, ?)",
+            (self._bucket, key, now + self._window),
+        )
+        rows = db.execute(
+            "SELECT COUNT(*) FROM rate_limits WHERE bucket = ?", (self._bucket,)
+        ).fetchone()[0]
+        if rows > _MAX_BUCKET_ROWS:
+            db.execute(
+                "DELETE FROM rate_limits WHERE rowid IN ("
+                "  SELECT rowid FROM rate_limits WHERE bucket = ?"
+                "  ORDER BY expires_at LIMIT ?)",
+                (self._bucket, rows - _MAX_BUCKET_ROWS),
+            )
+
+    def blocked(self, key: str) -> bool:
+        """True if the key is already at/over the limit (no event recorded)."""
+        with _db() as db:
+            return self._live(db, key, time.time()) >= self._max
+
+    def record(self, key: str) -> None:
+        """Record one event against the key."""
+        with _db() as db, _write_tx(db):
+            self._add(db, key, time.time())
+
+    def hit(self, key: str) -> bool:
+        """Record one event and return True if the key is now over the limit."""
+        with _db() as db, _write_tx(db):
+            now = time.time()
+            over = self._live(db, key, now) + 1 > self._max
+            self._add(db, key, now)
+            return over
+
+    def clear(self, key: str) -> None:
+        with _db() as db:
+            db.execute(
+                "DELETE FROM rate_limits WHERE bucket = ? AND key = ?",
+                (self._bucket, key),
+            )
+
+
+# Bucket names are the stored identity of each limiter: renaming one resets it
+# (its old rows simply age out), so keep them stable.
+_login_fail = _RateLimiter("login_fail", LOGIN_MAX_FAILS, LOGIN_WINDOW)
+_login_ip = _RateLimiter("login_ip", LOGIN_IP_MAX_FAILS, LOGIN_WINDOW)
+_register_limit = _RateLimiter("register", REGISTER_MAX, REGISTER_WINDOW)
+_chat_limit = _RateLimiter("chat", CHAT_MAX, CHAT_WINDOW)
+_card_limit = _RateLimiter("card", CARD_MAX, CARD_WINDOW)
+_pwlink_limit = _RateLimiter("pwlink", PWLINK_MAX, PWLINK_WINDOW)
+
+
+def chat_rate_limited(user_id: int) -> bool:
+    """Record a chat request for this user; True if they are now over CHAT_MAX."""
+    return _chat_limit.hit(str(user_id))
+
+
+def card_rate_limited(user_id: int) -> bool:
+    """Record a card lookup for this user; True if they are now over CARD_MAX."""
+    return _card_limit.hit(str(user_id))
 
 
 # ---------- spend accounting ----------
@@ -463,53 +562,70 @@ def record_usage(
     return cost
 
 
-def _utc_day_start_iso() -> str:
-    return _now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+def _utc_month_start_iso() -> str:
+    """00:00 UTC on the 1st of the current calendar month - the instant every
+    spend window resets. Calendar months, not rolling 30-day windows, so the
+    reset date a user is told is a real date they can put in a diary."""
+    return _now().replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
 
 
-def usage_today_micros(user_id: int) -> int:
-    """Total spend (micro-dollars) for this user since 00:00 UTC today."""
+def _next_month_start_iso() -> str:
+    """00:00 UTC on the 1st of NEXT month - when the current window rolls over.
+    A month is long enough that "it resets eventually" isn't good enough: the
+    account page shows this date so someone who has hit their cap knows exactly
+    how long they're waiting."""
+    start = _now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # 32 days past the 1st always lands somewhere inside the following month
+    # (months run 28-31 days), so snapping back to day 1 gives its start with
+    # no calendar arithmetic and no December wrap-around to special-case.
+    return (start + timedelta(days=32)).replace(day=1).isoformat()
+
+
+def usage_month_micros(user_id: int) -> int:
+    """Total spend (micro-dollars) for this user since the 1st of the month."""
     with _db() as db:
         row = db.execute(
             "SELECT COALESCE(SUM(cost_micros), 0) AS total FROM usage_ledger "
             "WHERE user_id = ? AND created_at >= ?",
-            (user_id, _utc_day_start_iso()),
+            (user_id, _utc_month_start_iso()),
         ).fetchone()
     return int(row["total"])
 
 
-def usage_today_credit_micros(user_id: int) -> int:
-    """Today's spend in CREDIT dollars: the raw cost marked up exactly the way
-    record_usage deducts it. The daily limit and every user-facing spend
+def usage_month_credit_micros(user_id: int) -> int:
+    """This month's spend in CREDIT dollars: the raw cost marked up exactly the
+    way record_usage deducts it. The monthly limit and every user-facing spend
     readout are denominated this way so they line up with the balance the user
     watches drop - a $5 limit means $5 off the balance, not $5 of raw cost
     (which would be $7 of credits). Derived from the raw ledger rather than
     summed from credits_ledger so the cap still works with BILLING_REQUIRED
     off, when nothing is being deducted yet."""
-    return int(round(usage_today_micros(user_id) * CREDIT_MARKUP))
+    return int(round(usage_month_micros(user_id) * CREDIT_MARKUP))
 
 
 def _budget_from_row(row) -> int:
-    """Daily limit (credit micro-dollars) from an already-loaded user row.
+    """Monthly limit (credit micro-dollars) from an already-loaded user row.
     NULL -> the default; negative -> unlimited (a sentinel the callers treat as
     no cap)."""
     if row is None:
-        return DEFAULT_DAILY_BUDGET_MICROS
-    override = row["daily_budget_micros"]
-    return DEFAULT_DAILY_BUDGET_MICROS if override is None else int(override)
+        return DEFAULT_MONTHLY_BUDGET_MICROS
+    override = row["monthly_budget_micros"]
+    return DEFAULT_MONTHLY_BUDGET_MICROS if override is None else int(override)
 
 
 def _budget_for(user_id: int) -> int:
-    """This user's daily limit in credit micro-dollars."""
+    """This user's monthly limit in credit micro-dollars."""
     with _db() as db:
         row = db.execute(
-            "SELECT daily_budget_micros FROM users WHERE id = ?", (user_id,)
+            "SELECT monthly_budget_micros FROM users WHERE id = ?", (user_id,)
         ).fetchone()
     return _budget_from_row(row)
 
 
-def daily_budget_exceeded(user_id: int) -> bool:
-    """True if the user has already met or passed their daily limit. Checked
+def monthly_budget_exceeded(user_id: int) -> bool:
+    """True if the user has already met or passed their monthly limit. Checked
     BEFORE a request starts; since token cost isn't known until generation
     finishes, the request that crosses the line is allowed to complete and the
     next one is refused. Per-request overshoot is bounded by max_tokens and the
@@ -517,36 +633,37 @@ def daily_budget_exceeded(user_id: int) -> bool:
     budget = _budget_for(user_id)
     if budget < 0:
         return False  # unlimited
-    return usage_today_credit_micros(user_id) >= budget
+    return usage_month_credit_micros(user_id) >= budget
 
 
-def set_daily_budget(email: str, micros: Optional[int]) -> bool:
-    """Set a per-user daily limit override by email. None clears it (back to
+def set_monthly_budget(email: str, micros: Optional[int]) -> bool:
+    """Set a per-user monthly limit override by email. None clears it (back to
     default); a negative value means unlimited. Called by admin.py, which is
     the only path allowed to clear it or lift the cap entirely."""
     with _db() as db:
         cur = db.execute(
-            "UPDATE users SET daily_budget_micros = ? WHERE email = ?",
+            "UPDATE users SET monthly_budget_micros = ? WHERE email = ?",
             (micros, _normalize_email(email)),
         )
         return cur.rowcount > 0
 
 
-def set_user_daily_limit(user_id: int, micros: int) -> None:
+def set_user_monthly_limit(user_id: int, micros: int) -> None:
     """The self-service setter behind the account page. Always stores a
-    concrete number inside [MIN_DAILY_LIMIT_MICROS, MAX_DAILY_LIMIT_MICROS] -
-    users can't clear the limit or make it unlimited, only admins can."""
-    micros = max(MIN_DAILY_LIMIT_MICROS, min(int(micros), MAX_DAILY_LIMIT_MICROS))
+    concrete number inside [MIN_MONTHLY_LIMIT_MICROS, MAX_MONTHLY_LIMIT_MICROS]
+    - users can't clear the limit or make it unlimited, only admins can."""
+    micros = max(MIN_MONTHLY_LIMIT_MICROS, min(int(micros), MAX_MONTHLY_LIMIT_MICROS))
     with _db() as db:
         db.execute(
-            "UPDATE users SET daily_budget_micros = ? WHERE id = ?",
+            "UPDATE users SET monthly_budget_micros = ? WHERE id = ?",
             (micros, user_id),
         )
 
 
-def ensure_daily_limit_default(user_id: int) -> None:
-    """Give a user their first daily limit the moment they first hold credits:
-    their whole balance, i.e. "I bought $10, I can spend $10 today".
+def ensure_monthly_limit_default(user_id: int) -> None:
+    """Give a user their first monthly limit the moment they first hold
+    credits: their whole balance, i.e. "I bought $10, I can spend $10 this
+    month".
 
     Only ever fills a NULL, which is the point - topping up later must NOT
     raise (or reset) a limit the user has since chosen, and an admin override
@@ -554,9 +671,9 @@ def ensure_daily_limit_default(user_id: int) -> None:
     """
     with _db() as db:
         row = db.execute(
-            "SELECT daily_budget_micros FROM users WHERE id = ?", (user_id,)
+            "SELECT monthly_budget_micros FROM users WHERE id = ?", (user_id,)
         ).fetchone()
-        if row is None or row["daily_budget_micros"] is not None:
+        if row is None or row["monthly_budget_micros"] is not None:
             return
         balance = int(db.execute(
             "SELECT COALESCE(SUM(amount_micros), 0) AS total FROM credits_ledger "
@@ -566,17 +683,17 @@ def ensure_daily_limit_default(user_id: int) -> None:
         if balance <= 0:
             return
         db.execute(
-            "UPDATE users SET daily_budget_micros = ? "
-            "WHERE id = ? AND daily_budget_micros IS NULL",
-            (max(MIN_DAILY_LIMIT_MICROS, min(balance, MAX_DAILY_LIMIT_MICROS)), user_id),
+            "UPDATE users SET monthly_budget_micros = ? "
+            "WHERE id = ? AND monthly_budget_micros IS NULL",
+            (max(MIN_MONTHLY_LIMIT_MICROS, min(balance, MAX_MONTHLY_LIMIT_MICROS)), user_id),
         )
 
 
-def daily_limit_view(user_row) -> dict:
-    """The daily-limit block the account page renders and edits. All amounts
-    are credit dollars (see usage_today_credit_micros)."""
+def monthly_limit_view(user_row) -> dict:
+    """The monthly-limit block the account page renders and edits. All amounts
+    are credit dollars (see usage_month_credit_micros)."""
     budget = _budget_from_row(user_row)
-    spent = usage_today_credit_micros(user_row["id"])
+    spent = usage_month_credit_micros(user_row["id"])
     unlimited = budget < 0
     return {
         "usd": None if unlimited else round(budget / 1_000_000, 2),
@@ -584,25 +701,26 @@ def daily_limit_view(user_row) -> dict:
         # False while the user is still on the global default - the account
         # page says "we'll set this for you when you buy credits" instead of
         # presenting the number as a choice they made.
-        "is_custom": user_row["daily_budget_micros"] is not None,
-        "spent_today_usd": round(spent / 1_000_000, 2),
+        "is_custom": user_row["monthly_budget_micros"] is not None,
+        "spent_month_usd": round(spent / 1_000_000, 2),
         "remaining_usd": None if unlimited else round(
             max(0, budget - spent) / 1_000_000, 2
         ),
-        "min_usd": round(MIN_DAILY_LIMIT_MICROS / 1_000_000, 2),
-        "max_usd": round(MAX_DAILY_LIMIT_MICROS / 1_000_000, 2),
+        "min_usd": round(MIN_MONTHLY_LIMIT_MICROS / 1_000_000, 2),
+        "max_usd": round(MAX_MONTHLY_LIMIT_MICROS / 1_000_000, 2),
+        "resets_at": _next_month_start_iso(),
     }
 
 
-def usage_summary_today(email: str) -> Optional[dict]:
-    """Per-user view of today's spend and remaining limit, for admin display.
-    Reports both the raw cost (what we pay Anthropic) and the credit-dollar
-    figure the limit is measured in."""
+def usage_summary_month(email: str) -> Optional[dict]:
+    """Per-user view of this month's spend and remaining limit, for admin
+    display. Reports both the raw cost (what we pay Anthropic) and the
+    credit-dollar figure the limit is measured in."""
     user = get_user_by_email(_normalize_email(email))
     if not user:
         return None
-    raw = usage_today_micros(user["id"])
-    spent = usage_today_credit_micros(user["id"])
+    raw = usage_month_micros(user["id"])
+    spent = usage_month_credit_micros(user["id"])
     budget = _budget_from_row(user)
     return {
         "email": user["email"],
@@ -620,7 +738,7 @@ def credit_balance_micros(user_id: int) -> int:
     """The user's prepaid balance: every purchase/grant minus every marked-up
     usage deduction. Can go slightly negative - output tokens aren't known
     until a request finishes, so the request that empties the balance is
-    allowed to complete and the next one is refused (same shape as the daily
+    allowed to complete and the next one is refused (same shape as the monthly
     budget check)."""
     with _db() as db:
         row = db.execute(
@@ -651,11 +769,11 @@ def add_credits(
             (user_id, amount_micros, kind, stripe_ref, note, _now().isoformat()),
         )
         written = cur.rowcount > 0
-    # First money in gets a daily limit to match. Deliberately after the insert
-    # so the balance it snapshots includes this credit, and skipped for a
-    # duplicate so a webhook retry can't move a limit the user has since set.
+    # First money in gets a monthly limit to match. Deliberately after the
+    # insert so the balance it snapshots includes this credit, and skipped for
+    # a duplicate so a webhook retry can't move a limit the user has since set.
     if written and amount_micros > 0 and kind in ("purchase", "grant"):
-        ensure_daily_limit_default(user_id)
+        ensure_monthly_limit_default(user_id)
     return written
 
 
@@ -996,6 +1114,19 @@ def _insert_user(email: str, pw_hash: str, name: Optional[str] = None) -> int:
     the subscription half of the gate - usage still needs purchased credits -
     so it is a "try it for a week, pay only for what you use" window rather
     than free API spend.
+
+    Accounts are approved on creation: the money gate (subscription + credits)
+    is what actually limits usage, so making people wait for a human to let
+    them in bought nothing. `approved` survives as the revoke switch - see
+    set_approved - so an abusive account can still be shut off and later let
+    back in.
+
+    No credits are granted here, and none should be. A new account's balance is
+    $0.00 and stays there until money moves: a paid Checkout session
+    (billing._credit_paid_session) or a deliberate admin grant (grant_credits)
+    are the only two writers of positive credits_ledger rows. Registration is
+    open, so a welcome bonus here would be an open invitation to farm accounts
+    for free API spend.
     """
     now = _now()
     trial_end = (now + timedelta(days=TRIAL_DAYS)).isoformat()
@@ -1003,7 +1134,7 @@ def _insert_user(email: str, pw_hash: str, name: Optional[str] = None) -> int:
         cur = db.execute(
             "INSERT INTO users (email, password_hash, name, approved, is_admin, "
             "subscription_status, subscription_period_end, trial_ends_at, created_at) "
-            "VALUES (?, ?, ?, 0, 0, 'trialing', ?, ?, ?)",
+            "VALUES (?, ?, ?, 1, 0, 'trialing', ?, ?, ?)",
             (email, pw_hash, name, trial_end, trial_end, now.isoformat()),
         )
         return cur.lastrowid
@@ -1105,7 +1236,7 @@ def consume_reset_token(token: str) -> Optional[int]:
 
 def list_users() -> list[sqlite3.Row]:
     # SELECT * so callers can pass rows straight to subscription_ok() /
-    # daily_limit_view(), which read the trial, cancellation and limit columns.
+    # monthly_limit_view(), which read the trial, cancellation and limit columns.
     with _db() as db:
         return db.execute("SELECT * FROM users ORDER BY created_at").fetchall()
 
@@ -1118,6 +1249,9 @@ def count_admins() -> int:
 
 
 def set_approved(email: str, approved: bool) -> bool:
+    """Suspend (False) or reinstate (True) an account. Signups arrive approved,
+    so this is the moderation switch rather than an intake queue - and it moves
+    in both directions, so a revoked account can always be let back in."""
     with _db() as db:
         cur = db.execute(
             "UPDATE users SET approved = ? WHERE email = ?",
@@ -1260,12 +1394,13 @@ def require_user(request: Request) -> sqlite3.Row:
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not user["approved"]:
-        raise HTTPException(status_code=403, detail="Account not approved")
+        raise HTTPException(status_code=403, detail="Account suspended")
     return user
 
 
 def require_admin(request: Request) -> sqlite3.Row:
-    """Gate for the admin panel and its API. Authenticated + approved + admin."""
+    """Gate for the admin panel and its API. Authenticated + not suspended +
+    admin."""
     user = require_user(request)
     if not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -1314,8 +1449,8 @@ def register(req: RegisterReq, request: Request):
             pass  # Lost a race; treat as success.
 
     return {
-        "message": "Registration submitted. An administrator must approve "
-                   "the account before you can sign in."
+        "message": "Account created. You can sign in now — your free trial "
+                   f"runs for {TRIAL_DAYS} days."
     }
 
 
@@ -1342,9 +1477,10 @@ def login(req: LoginReq, request: Request, response: Response):
         raise HTTPException(401, "Invalid Credentials. Check your input.")
 
     if not user["approved"]:
-        # Don't differentiate "wrong password" from "not approved" to outsiders;
-        # the approval message comes through the registration response.
-        raise HTTPException(403, "Account is pending approval.")
+        # Reached only for an account an admin has revoked - registration
+        # approves by default. The credentials were correct, so there is
+        # nothing to hide by being vague here.
+        raise HTTPException(403, "This account has been suspended.")
 
     # Clear the per-account counter on success. The per-IP counter is left to
     # age out so one success can't reset a spraying attack from the same IP.
@@ -1365,10 +1501,10 @@ def logout(request: Request, response: Response):
 
 @router.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    # Spend is reported in credit dollars, the same units as the daily limit
-    # and the balance, so the header's "$0.40 / $5.00 today" reads against the
-    # number the user actually watches drop rather than raw Anthropic cost.
-    spent = usage_today_credit_micros(user["id"])
+    # Spend is reported in credit dollars, the same units as the monthly limit
+    # and the balance, so the header's "$0.40 / $5.00 this month" reads against
+    # the number the user actually watches drop rather than raw Anthropic cost.
+    spent = usage_month_credit_micros(user["id"])
     budget = _budget_from_row(user)
     unlimited = budget < 0
     return {
