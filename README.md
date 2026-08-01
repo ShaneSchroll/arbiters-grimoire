@@ -50,18 +50,7 @@ uvicorn server:app --port 8000
 
 Every new account starts on a 7-day trial. After that, users pay a $5/month
 Stripe subscription for access plus prepaid usage credits ($5 / $10 / $20
-packs) that are deducted (raw Anthropic cost × `CREDIT_MARKUP`) as they use
-the Arbiter and Deck Builder.
-
-**Credits are non-refundable**, and an account may hold at most
-`MAX_CREDIT_BALANCE_USD` (default $20) at a time — packs that would overshoot
-are refused at checkout and greyed out on `/account`. Cancelling always leaves
-access running to the end of whatever the user already has (the rest of the
-trial, or the period they've paid for), so a balance is never stranded early.
-
-Payments run entirely on Stripe-hosted Checkout; the webhook at
-`/api/stripe/webhook` mirrors state into `users.db`. Nothing is enforced until
-`BILLING_REQUIRED=1` is set.
+packs) that are deducted as they use the Arbiter and Deck Builder.
 
 ## Commands to work with users
 
@@ -102,7 +91,7 @@ automatically falls back to fixed-size chunks.
 ## How it works
 
 For each question the backend
-    1. Retrieves the most relevant rulebook chunks
-    2. Sends them to Claude with a judge-level system prompt
-    3. Lets Claude call the Scryfall tool if a card is named
-    4. returns the answer plus the rule sources, shown as chips under each reply
+    1. Retrieves the most relevant rulebook chunks (official rulebook parsed into JSON for the AI)
+    2. Sends them to Claude with a judge-level system prompt and the users board state / question
+    3. Lets Claude call the Scryfall tool if a card is named and not cached in cards.db
+    4. Returns the answer plus the rule sources it cites, shown as chips under each reply
