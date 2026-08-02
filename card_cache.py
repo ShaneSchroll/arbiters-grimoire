@@ -42,6 +42,24 @@ class CardCache:
         self.updated_at = row["value"] if row else ""
         (self.count,) = self._con.execute("SELECT COUNT(*) FROM cards").fetchone()
 
+    @staticmethod
+    def _prefix_range(norm: str) -> tuple[str, str] | None:
+        """Half-open [lo, hi) bounds matching every norm starting with `norm`.
+
+        A range comparison is what lets these queries ride idx_cards_norm.
+        `norm LIKE 'x%'` cannot: SQLite only optimizes LIKE into a range scan
+        when the column's collation matches LIKE's own case-insensitivity, and
+        `norm` is BINARY — so the planner falls back to scanning all ~34k rows
+        (~14ms a pop, vs ~1ms here). That difference is the whole reason
+        per-keystroke autocomplete is affordable on a small box.
+
+        Returns None if the last character can't be incremented without landing
+        on a surrogate (unencodable in UTF-8); callers fall back to LIKE."""
+        last = ord(norm[-1])
+        if 0xD7FF <= last <= 0xDFFF:
+            return None
+        return norm, norm[:-1] + chr(last + 1)
+
     def get(self, name: str) -> dict | None:
         """Return the projected card dict for `name`, or None if not cached.
 
@@ -59,9 +77,15 @@ class CardCache:
             return json.loads(row["data"])
 
         # Unique prefix match (e.g. "lightning bo" -> "Lightning Bolt").
-        rows = self._con.execute(
-            "SELECT data FROM cards WHERE norm LIKE ? LIMIT 2", (norm + "%",)
-        ).fetchall()
+        bounds = self._prefix_range(norm)
+        if bounds:
+            rows = self._con.execute(
+                "SELECT data FROM cards WHERE norm >= ? AND norm < ? LIMIT 2", bounds
+            ).fetchall()
+        else:
+            rows = self._con.execute(
+                "SELECT data FROM cards WHERE norm LIKE ? LIMIT 2", (norm + "%",)
+            ).fetchall()
         if len(rows) == 1:
             return json.loads(rows[0]["data"])
 
@@ -75,15 +99,41 @@ class CardCache:
 
         return None
 
-    def autocomplete(self, prefix: str, limit: int = 10) -> list[str]:
-        """Names starting with `prefix` — handy for a deck-builder name field.
-        Cheap enough to call per keystroke; backs the optional /api/card/suggest
-        endpoint."""
+    def _prefix_rows(self, columns: str, prefix: str, limit: int) -> list:
+        """Rows whose norm starts with `prefix`, shortest name first — so typing
+        "sol r" surfaces "Sol Ring" above the longer names sharing the prefix."""
         norm = normalize_name(prefix)
         if not norm:
             return []
-        rows = self._con.execute(
-            "SELECT name FROM cards WHERE norm LIKE ? ORDER BY length(name) LIMIT ?",
+        order = " ORDER BY length(name), name LIMIT ?"
+        bounds = self._prefix_range(norm)
+        if bounds:
+            return self._con.execute(
+                f"SELECT {columns} FROM cards WHERE norm >= ? AND norm < ?" + order,
+                (*bounds, limit),
+            ).fetchall()
+        return self._con.execute(
+            f"SELECT {columns} FROM cards WHERE norm LIKE ?" + order,
             (norm + "%", limit),
         ).fetchall()
-        return [r["name"] for r in rows]
+
+    def autocomplete(self, prefix: str, limit: int = 10) -> list[str]:
+        """Names starting with `prefix` — for the deck builder's list field.
+        Cheap enough to call per keystroke (see _prefix_range); backs the
+        /api/card/suggest endpoint."""
+        return [r["name"] for r in self._prefix_rows("name", prefix, limit)]
+
+    def autocomplete_detailed(self, prefix: str, limit: int = 10) -> list[dict]:
+        """Like autocomplete, plus mana cost and type line, for the deck
+        builder's search-and-add overlay where the extra fields disambiguate
+        similarly-named cards. Parsing the projected JSON for a handful of rows
+        is not measurably slower than fetching names alone."""
+        out = []
+        for r in self._prefix_rows("name, data", prefix, limit):
+            card = json.loads(r["data"])
+            out.append({
+                "name": card.get("name") or r["name"],
+                "cost": card.get("mana_cost") or "",
+                "type": card.get("type_line") or "",
+            })
+        return out

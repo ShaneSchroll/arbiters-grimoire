@@ -97,6 +97,17 @@ def project(card: dict) -> dict:
             for fmt, status in card.get("legalities", {}).items()
             if status == "legal"
         },
+        # `legalities` keeps only the formats a card is legal in, so a banned
+        # card and a card simply outside the format's pool both read as "absent"
+        # there. The Deck Builder has to tell those apart — "banned in Commander"
+        # is a very different message from "not a Commander card" — so the ban
+        # list is carried separately. Empty for the overwhelming majority of
+        # cards, hence cheap to store.
+        "banned_in": sorted(
+            fmt
+            for fmt, status in card.get("legalities", {}).items()
+            if status == "banned"
+        ),
         "scryfall_uri": card.get("scryfall_uri"),
     }
 
